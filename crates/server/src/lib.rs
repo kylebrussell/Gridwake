@@ -118,6 +118,19 @@ fn cap_network_lod(default_lod: NetworkLod, selected_lod: NetworkLod) -> Network
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NetworkLodContext {
+    pub client: ClientId,
+    pub entity: EntityId,
+    pub client_position: Vec3,
+    pub entity_position: Vec3,
+    pub interest_radius: f32,
+    pub distance_squared: f32,
+    pub entity_lod_cap: NetworkLod,
+    pub previous_lod: Option<NetworkLod>,
+    pub policy_lod: NetworkLod,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ServerConfig {
     pub tick_rate_hz: u16,
@@ -1114,6 +1127,14 @@ impl ServerRuntime {
     }
 
     pub fn advance_tick<T: Transport>(&mut self, transport: &mut T) -> TickMetrics {
+        self.advance_tick_with_network_lod_selector(transport, |context| context.policy_lod)
+    }
+
+    pub fn advance_tick_with_network_lod_selector<T: Transport>(
+        &mut self,
+        transport: &mut T,
+        mut selector: impl FnMut(NetworkLodContext) -> NetworkLod,
+    ) -> TickMetrics {
         let tick = self.tick.advance();
         let snapshot_id = SnapshotId::new(tick.raw());
         let mut metrics = TickMetrics {
@@ -1130,7 +1151,8 @@ impl ServerRuntime {
             let visible = self.aoi.query_observer(client).unwrap_or_default();
             metrics.aoi_candidates += visible.len();
             let visibility = self.replication.set_visibility(client, visible);
-            let network_lod = self.network_lod_for_client(client, &visibility.visible);
+            let network_lod =
+                self.network_lod_for_client(client, &visibility.visible, &mut selector);
             let selection = self.replication.select_for_client_with_lod(
                 client,
                 ByteBudget::new(self.config.per_client_byte_budget),
@@ -1243,6 +1265,7 @@ impl ServerRuntime {
         &self,
         client: ClientId,
         visible_entities: &[EntityId],
+        selector: &mut impl FnMut(NetworkLodContext) -> NetworkLod,
     ) -> HashMap<EntityId, NetworkLod> {
         let Some(client) = self.clients.get(&client) else {
             return HashMap::new();
@@ -1255,7 +1278,7 @@ impl ServerRuntime {
             };
             let distance_squared = client.position.distance_squared(entity.position);
             let previous_lod = self.replication.last_sent_lod(client.id, *entity_id);
-            let lod = self
+            let policy_lod = self
                 .config
                 .network_lod
                 .lod_for_distance_squared_with_previous(
@@ -1263,6 +1286,17 @@ impl ServerRuntime {
                     client.interest_radius,
                     previous_lod,
                 );
+            let lod = selector(NetworkLodContext {
+                client: client.id,
+                entity: *entity_id,
+                client_position: client.position,
+                entity_position: entity.position,
+                interest_radius: client.interest_radius,
+                distance_squared,
+                entity_lod_cap: entity.lod,
+                previous_lod,
+                policy_lod,
+            });
             lod_by_entity.insert(*entity_id, cap_network_lod(entity.lod, lod));
         }
 
@@ -1620,6 +1654,79 @@ mod tests {
         assert_eq!(
             snapshot_payload_for(&transport, far_client, entity),
             b"min".to_vec()
+        );
+    }
+
+    #[test]
+    fn custom_network_lod_selector_overrides_distance_policy() {
+        let mut runtime = ServerRuntime::new(ServerConfig {
+            default_interest_radius: 100.0,
+            per_client_byte_budget: 64,
+            network_lod: NetworkLodPolicy {
+                full_distance_ratio: 1.0,
+                reduced_distance_ratio: 1.0,
+                hysteresis_ratio: 0.0,
+            },
+            ..ServerConfig::default()
+        });
+        let client = ClientId::new(1);
+        let entity = EntityId::new(1);
+        let mut transport = FakeTransport::default();
+
+        runtime.connect_client(client, Vec3::ZERO, None);
+        runtime.spawn_entity_with_lod_payloads(
+            entity,
+            Vec3::ZERO,
+            NetworkLodPayloads::new(b"full".to_vec(), b"reduced".to_vec(), b"min".to_vec()),
+            1.0,
+            NetworkLod::Full,
+        );
+
+        let metrics = runtime.advance_tick_with_network_lod_selector(&mut transport, |context| {
+            assert_eq!(context.client, client);
+            assert_eq!(context.entity, entity);
+            assert_eq!(context.client_position, Vec3::ZERO);
+            assert_eq!(context.entity_position, Vec3::ZERO);
+            assert_eq!(context.interest_radius, 100.0);
+            assert_eq!(context.distance_squared, 0.0);
+            assert_eq!(context.entity_lod_cap, NetworkLod::Full);
+            assert_eq!(context.previous_lod, None);
+            assert_eq!(context.policy_lod, NetworkLod::Full);
+            NetworkLod::Minimal
+        });
+
+        assert_eq!(metrics.selected_updates, 1);
+        assert_eq!(
+            snapshot_payload_for(&transport, client, entity),
+            b"min".to_vec()
+        );
+    }
+
+    #[test]
+    fn custom_network_lod_selector_still_respects_entity_lod_cap() {
+        let mut runtime = ServerRuntime::new(ServerConfig {
+            default_interest_radius: 100.0,
+            per_client_byte_budget: 64,
+            ..ServerConfig::default()
+        });
+        let client = ClientId::new(1);
+        let entity = EntityId::new(1);
+        let mut transport = FakeTransport::default();
+
+        runtime.connect_client(client, Vec3::ZERO, None);
+        runtime.spawn_entity_with_lod_payloads(
+            entity,
+            Vec3::ZERO,
+            NetworkLodPayloads::new(b"full".to_vec(), b"reduced".to_vec(), b"min".to_vec()),
+            1.0,
+            NetworkLod::Reduced,
+        );
+
+        runtime.advance_tick_with_network_lod_selector(&mut transport, |_| NetworkLod::Full);
+
+        assert_eq!(
+            snapshot_payload_for(&transport, client, entity),
+            b"reduced".to_vec()
         );
     }
 
