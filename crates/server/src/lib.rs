@@ -1,4 +1,6 @@
 use std::collections::{HashMap, VecDeque};
+use std::io::{self, ErrorKind};
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::Duration;
 
 use gridwake_aoi::{CellCoord, GridAoi, GridAoiConfig, InterestIndex};
@@ -396,6 +398,126 @@ impl ByteTransport for MemoryByteTransport {
 
     fn drain_received_bytes(&mut self) -> Vec<RoutedClientBytes> {
         self.received.drain(..).collect()
+    }
+}
+
+const UDP_RECV_BUFFER_BYTES: usize = 65_536;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UdpTransportError {
+    UnknownClient { client: ClientId, bytes: usize },
+    UnknownPeer { peer: SocketAddr, bytes: usize },
+    Send { client: ClientId, error: ErrorKind },
+    Receive { error: ErrorKind },
+}
+
+#[derive(Debug)]
+pub struct UdpByteTransport {
+    socket: UdpSocket,
+    clients: HashMap<ClientId, SocketAddr>,
+    peers: HashMap<SocketAddr, ClientId>,
+    errors: Vec<UdpTransportError>,
+    recv_buffer: Vec<u8>,
+}
+
+impl UdpByteTransport {
+    pub fn bind(addr: impl ToSocketAddrs) -> io::Result<Self> {
+        Self::from_socket(UdpSocket::bind(addr)?)
+    }
+
+    pub fn from_socket(socket: UdpSocket) -> io::Result<Self> {
+        socket.set_nonblocking(true)?;
+        Ok(Self {
+            socket,
+            clients: HashMap::new(),
+            peers: HashMap::new(),
+            errors: Vec::new(),
+            recv_buffer: vec![0; UDP_RECV_BUFFER_BYTES],
+        })
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
+    pub fn register_client(&mut self, client: ClientId, addr: SocketAddr) -> Option<SocketAddr> {
+        let previous_addr = self.clients.insert(client, addr);
+        if let Some(previous_addr) = previous_addr {
+            self.peers.remove(&previous_addr);
+        }
+        if let Some(previous_client) = self.peers.insert(addr, client) {
+            if previous_client != client {
+                self.clients.remove(&previous_client);
+            }
+        }
+        previous_addr
+    }
+
+    pub fn remove_client(&mut self, client: ClientId) -> Option<SocketAddr> {
+        let addr = self.clients.remove(&client)?;
+        if self.peers.get(&addr) == Some(&client) {
+            self.peers.remove(&addr);
+        }
+        Some(addr)
+    }
+
+    pub fn client_addr(&self, client: ClientId) -> Option<SocketAddr> {
+        self.clients.get(&client).copied()
+    }
+
+    pub fn errors(&self) -> &[UdpTransportError] {
+        &self.errors
+    }
+
+    pub fn take_errors(&mut self) -> Vec<UdpTransportError> {
+        std::mem::take(&mut self.errors)
+    }
+}
+
+impl ByteTransport for UdpByteTransport {
+    fn send_bytes(&mut self, client: ClientId, bytes: Vec<u8>) {
+        let Some(addr) = self.clients.get(&client).copied() else {
+            self.errors.push(UdpTransportError::UnknownClient {
+                client,
+                bytes: bytes.len(),
+            });
+            return;
+        };
+
+        if let Err(error) = self.socket.send_to(&bytes, addr) {
+            self.errors.push(UdpTransportError::Send {
+                client,
+                error: error.kind(),
+            });
+        }
+    }
+
+    fn drain_received_bytes(&mut self) -> Vec<RoutedClientBytes> {
+        let mut received = Vec::new();
+        loop {
+            match self.socket.recv_from(&mut self.recv_buffer) {
+                Ok((len, peer)) => {
+                    if let Some(client) = self.peers.get(&peer).copied() {
+                        received.push(RoutedClientBytes {
+                            client,
+                            bytes: self.recv_buffer[..len].to_vec(),
+                        });
+                    } else {
+                        self.errors
+                            .push(UdpTransportError::UnknownPeer { peer, bytes: len });
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    self.errors.push(UdpTransportError::Receive {
+                        error: error.kind(),
+                    });
+                    break;
+                }
+            }
+        }
+        received
     }
 }
 
@@ -1033,11 +1155,26 @@ impl ServerRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gridwake_protocol::decode_server_message;
+    use std::net::UdpSocket;
+    use std::thread;
+    use std::time::Instant;
+
+    use gridwake_protocol::{decode_server_message, encode_client_message};
     use gridwake_snapshot::DeltaOp;
 
     fn payload(id: u64) -> Vec<u8> {
         id.to_le_bytes().to_vec()
+    }
+
+    fn poll_until_nonempty<T>(mut poll: impl FnMut() -> Vec<T>) -> Vec<T> {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let values = poll();
+            if !values.is_empty() || Instant::now() >= deadline {
+                return values;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     fn snapshot_payload_for(
@@ -1483,6 +1620,114 @@ mod tests {
             panic!("expected snapshot delta");
         };
         assert_eq!(delta.baseline, Some(SnapshotId::new(1)));
+    }
+
+    #[test]
+    fn udp_byte_transport_routes_registered_client_datagrams(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let server_socket = UdpSocket::bind("127.0.0.1:0")?;
+        let server_addr = server_socket.local_addr()?;
+        let client_socket = UdpSocket::bind("127.0.0.1:0")?;
+        client_socket.set_read_timeout(Some(Duration::from_secs(1)))?;
+        let client_addr = client_socket.local_addr()?;
+        let client = ClientId::new(7);
+        let mut transport = UdpByteTransport::from_socket(server_socket)?;
+
+        assert_eq!(transport.register_client(client, client_addr), None);
+        assert_eq!(transport.client_addr(client), Some(client_addr));
+
+        client_socket.send_to(b"inbound", server_addr)?;
+        let received = poll_until_nonempty(|| transport.drain_received_bytes());
+        assert_eq!(
+            received,
+            vec![RoutedClientBytes {
+                client,
+                bytes: b"inbound".to_vec()
+            }]
+        );
+
+        transport.send_bytes(client, b"outbound".to_vec());
+        let mut buffer = [0; 64];
+        let (len, peer) = client_socket.recv_from(&mut buffer)?;
+
+        assert_eq!(peer, server_addr);
+        assert_eq!(&buffer[..len], b"outbound");
+        assert!(transport.errors().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn udp_byte_transport_records_unknown_routes() -> Result<(), Box<dyn std::error::Error>> {
+        let server_socket = UdpSocket::bind("127.0.0.1:0")?;
+        let server_addr = server_socket.local_addr()?;
+        let unknown_socket = UdpSocket::bind("127.0.0.1:0")?;
+        let unknown_addr = unknown_socket.local_addr()?;
+        let mut transport = UdpByteTransport::from_socket(server_socket)?;
+        let client = ClientId::new(99);
+
+        transport.send_bytes(client, b"missing-client".to_vec());
+        unknown_socket.send_to(b"unknown-peer", server_addr)?;
+        assert!(poll_until_nonempty(|| transport.drain_received_bytes()).is_empty());
+
+        assert_eq!(
+            transport.take_errors(),
+            vec![
+                UdpTransportError::UnknownClient {
+                    client,
+                    bytes: b"missing-client".len()
+                },
+                UdpTransportError::UnknownPeer {
+                    peer: unknown_addr,
+                    bytes: b"unknown-peer".len()
+                }
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn codec_transport_round_trips_typed_messages_over_udp(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let server_socket = UdpSocket::bind("127.0.0.1:0")?;
+        let server_addr = server_socket.local_addr()?;
+        let client_socket = UdpSocket::bind("127.0.0.1:0")?;
+        client_socket.set_read_timeout(Some(Duration::from_secs(1)))?;
+        let client_addr = client_socket.local_addr()?;
+        let client = ClientId::new(3);
+        let mut transport = CodecTransport::new(UdpByteTransport::from_socket(server_socket)?);
+
+        transport.inner_mut().register_client(client, client_addr);
+
+        let inbound = ClientMessage::AckSnapshot {
+            sequence: SnapshotId::new(42),
+        };
+        client_socket.send_to(&encode_client_message(&inbound)?, server_addr)?;
+        let received = poll_until_nonempty(|| transport.drain_received());
+        assert_eq!(
+            received,
+            vec![RoutedClientMessage {
+                client,
+                message: inbound
+            }]
+        );
+
+        let outbound = ServerMessage::Metrics(MetricsFrame {
+            tick: Tick::new(7),
+            clients: 1,
+            entities: 2,
+            aoi_candidates: 3,
+            selected_updates: 4,
+            bytes_scheduled: 5,
+        });
+        transport.send(client, outbound.clone());
+
+        let mut buffer = [0; 512];
+        let (len, peer) = client_socket.recv_from(&mut buffer)?;
+        assert_eq!(peer, server_addr);
+        assert_eq!(decode_server_message(&buffer[..len])?, outbound);
+        assert!(transport.errors().is_empty());
+        assert!(transport.inner().errors().is_empty());
+        Ok(())
     }
 
     #[test]

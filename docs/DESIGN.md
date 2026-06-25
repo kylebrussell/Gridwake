@@ -11,7 +11,7 @@ The workspace uses crate-level boundaries so each subsystem can be tested indepe
 - `gridwake-replication` tracks client visibility, entity dirty generations, priority accumulation, per-client network LOD byte estimates, and byte-budgeted update selection.
 - `gridwake-snapshot` represents snapshot frames and delta operations without choosing a serializer or transport.
 - `gridwake-protocol` contains transport-neutral messages and a small versioned byte codec.
-- `gridwake-server` composes the crates into an authoritative fixed-step tick shell, adapts byte transports through the protocol codec, pumps inbound client messages, records metrics through sinks, applies distance-based per-client network LODs to snapshot payloads, retains bounded entity-position history for lag-compensation hooks, and tracks cell ownership for local versus cross-region event routing into dispatchable region batches.
+- `gridwake-server` composes the crates into an authoritative fixed-step tick shell, adapts memory or UDP byte transports through the protocol codec, pumps inbound client messages, records metrics through sinks, applies distance-based per-client network LODs to snapshot payloads, retains bounded entity-position history for lag-compensation hooks, and tracks cell ownership for local versus cross-region event routing into dispatchable region batches.
 - `gridwake-sim` drives fake clients and entities through deterministic synthetic scenarios using the same fixed-step scheduler and emits text or JSON summaries for repeatable load-test comparisons.
 
 ## Data Flow
@@ -47,6 +47,8 @@ real transport adapter
   -> typed Gridwake Transport trait
   -> ServerRuntime
 ```
+
+The first real socket adapter is a dependency-free UDP byte transport. It registers client socket addresses, records unknown-client or unknown-peer routing errors, and relies on the codec layer for typed Gridwake messages. Reliability, packet ordering, auth, NAT traversal, and production session lifecycle remain outside this adapter.
 
 The runtime can also be driven by elapsed wall-clock time:
 
@@ -86,7 +88,7 @@ source position/cell + target position/cell
 - Engine-neutral ids and payloads.
 - Transport-neutral messages.
 - Versioned message codec for future transport adapters.
-- Codec-backed byte transport adapter for transport implementations.
+- Codec-backed memory and UDP byte transport adapters for transport implementations.
 - AOI filtering before replication scheduling.
 - Byte budgets enforced per client.
 - Per-client network LOD byte estimates affect scheduling and emitted payloads.
@@ -104,5 +106,5 @@ source position/cell + target position/cell
 - Snapshot baselines are retained per client and used for runtime deltas; payload-level compression is not implemented yet.
 - Per-client network LOD is distance-band based; hysteresis, load feedback, and custom policy hooks are not implemented yet.
 - Lag-compensation support is exact-position history only; interpolation, hit shapes, and rewind physics are not implemented yet.
-- Real socket transport adapters are not implemented yet; the codec-backed byte adapter is the integration point.
+- A UDP byte adapter exists; production transport integrations, reliability, auth, and session lifecycle are not implemented yet.
 - The simulation harness has deterministic named scenarios, fixed-step ticking, and text/JSON summaries, but still needs sustained benchmark profiles and external visualization.

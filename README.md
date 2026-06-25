@@ -13,7 +13,7 @@ The project is intentionally not a renderer, editor, physics engine, matchmaking
 | `gridwake-replication` | Per-client visibility, dirty generations, priority accumulation, per-client network LOD byte estimates, and byte-budgeted selection. |
 | `gridwake-snapshot` | Snapshot frames, delta ops, retained baseline history, and ack tracking. |
 | `gridwake-protocol` | Transport-neutral client/server message enums, metric frames, and a versioned byte codec. |
-| `gridwake-server` | Authoritative runtime shell using fake/codec transports, inbound message pumping, fixed-step scheduling, metrics sinks, AOI, distance-based per-client LOD payloads, acked snapshot deltas, bounded lag-history hooks, cell ownership, and dispatchable cross-cell event batches. |
+| `gridwake-server` | Authoritative runtime shell using fake/memory/UDP codec transports, inbound message pumping, fixed-step scheduling, metrics sinks, AOI, distance-based per-client LOD payloads, acked snapshot deltas, bounded lag-history hooks, cell ownership, and dispatchable cross-cell event batches. |
 | `gridwake-sim` | Runnable load-test harness with fake clients, fake entities, fixed-step ticks, and named synthetic scenarios. |
 
 ## Adjacent Projects
@@ -46,7 +46,7 @@ cargo run -p gridwake-sim -- --scenario sparse-open-world --clients 100 --entiti
 - No renderer, editor, scene graph, animation system, or physics engine.
 - No matchmaking, account system, lobby service, or hosted backend replacement.
 - No hard dependency on Bevy, Unity, Unreal, Godot, or any ECS.
-- No hard dependency on a real transport; byte transports can plug in through the codec-backed adapter.
+- No hard dependency on a specific transport stack; byte transports plug in through the codec-backed adapter.
 
 ## License
 
@@ -60,4 +60,4 @@ Gridwake is dual-licensed under MIT OR Apache-2.0.
 4. Add snapshot/delta baselines and ack handling.
 5. Expand the simulation harness into larger repeatable benchmark scenarios.
 6. Grow cell-event outboxes into dispatchable multi-worker handoff batches and cross-cell delivery infrastructure.
-7. Add real transport adapters once the fake transport pipeline remains stable.
+7. Add real transport adapters and production transport integrations once the fake transport pipeline remains stable.
