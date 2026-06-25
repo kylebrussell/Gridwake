@@ -251,8 +251,10 @@ pub struct TickMetrics {
     pub entities: usize,
     pub aoi_candidates: usize,
     pub selected_updates: usize,
+    pub deferred_updates: usize,
     pub exit_updates: usize,
     pub bytes_scheduled: usize,
+    pub deferred_bytes: usize,
     pub messages_sent: usize,
 }
 
@@ -264,7 +266,9 @@ impl From<TickMetrics> for MetricsFrame {
             entities: metrics.entities,
             aoi_candidates: metrics.aoi_candidates,
             selected_updates: metrics.selected_updates,
+            deferred_updates: metrics.deferred_updates,
             bytes_scheduled: metrics.bytes_scheduled,
+            deferred_bytes: metrics.deferred_bytes,
         }
     }
 }
@@ -1034,6 +1038,10 @@ impl ServerRuntime {
             );
 
             metrics.selected_updates += selection.updates.len();
+            metrics.deferred_updates += selection.deferred_updates;
+            metrics.deferred_bytes = metrics
+                .deferred_bytes
+                .saturating_add(selection.deferred_bytes);
             metrics.exit_updates += visibility.exited.len();
 
             if selection.updates.is_empty() && visibility.exited.is_empty() {
@@ -1280,6 +1288,8 @@ mod tests {
         let metrics = runtime.advance_tick(&mut transport);
 
         assert_eq!(metrics.selected_updates, 1);
+        assert_eq!(metrics.deferred_updates, 1);
+        assert_eq!(metrics.deferred_bytes, 16);
         let ServerMessage::SnapshotDelta(delta) = &transport.sent[0].1 else {
             panic!("expected snapshot delta");
         };
@@ -1743,7 +1753,9 @@ mod tests {
             entities: 2,
             aoi_candidates: 3,
             selected_updates: 4,
-            bytes_scheduled: 5,
+            deferred_updates: 5,
+            bytes_scheduled: 6,
+            deferred_bytes: 7,
         });
         transport.send(client, outbound.clone());
 

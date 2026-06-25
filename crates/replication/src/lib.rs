@@ -114,6 +114,8 @@ pub struct Selection {
     pub updates: Vec<SelectedUpdate>,
     pub bytes_used: usize,
     pub bytes_remaining: usize,
+    pub deferred_updates: usize,
+    pub deferred_bytes: usize,
 }
 
 #[derive(Debug, Default)]
@@ -314,8 +316,12 @@ impl ReplicationGraph {
 
         let starting_bytes = budget.remaining();
         let mut updates = Vec::new();
+        let mut deferred_updates = 0;
+        let mut deferred_bytes: usize = 0;
         for candidate in candidates {
             if !budget.try_reserve(candidate.estimated_bytes) {
+                deferred_updates += 1;
+                deferred_bytes = deferred_bytes.saturating_add(candidate.estimated_bytes);
                 continue;
             }
 
@@ -342,6 +348,8 @@ impl ReplicationGraph {
             updates,
             bytes_used: starting_bytes - budget.remaining(),
             bytes_remaining: budget.remaining(),
+            deferred_updates,
+            deferred_bytes,
         }
     }
 }
@@ -390,6 +398,8 @@ mod tests {
         assert_eq!(selection.updates.len(), 1);
         assert_eq!(selection.updates[0].entity, high);
         assert_eq!(selection.bytes_used, 80);
+        assert_eq!(selection.deferred_updates, 1);
+        assert_eq!(selection.deferred_bytes, 80);
     }
 
     #[test]
@@ -480,6 +490,8 @@ mod tests {
 
         assert_eq!(selection.bytes_used, 75);
         assert_eq!(selection.updates.len(), 2);
+        assert_eq!(selection.deferred_updates, 1);
+        assert_eq!(selection.deferred_bytes, 100);
         assert!(selection
             .updates
             .iter()

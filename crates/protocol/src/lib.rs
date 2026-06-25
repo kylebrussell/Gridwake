@@ -25,7 +25,9 @@ pub struct MetricsFrame {
     pub entities: usize,
     pub aoi_candidates: usize,
     pub selected_updates: usize,
+    pub deferred_updates: usize,
     pub bytes_scheduled: usize,
+    pub deferred_bytes: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -226,7 +228,9 @@ fn write_metrics(out: &mut Vec<u8>, metrics: &MetricsFrame) {
     write_u64(out, metrics.entities as u64);
     write_u64(out, metrics.aoi_candidates as u64);
     write_u64(out, metrics.selected_updates as u64);
+    write_u64(out, metrics.deferred_updates as u64);
     write_u64(out, metrics.bytes_scheduled as u64);
+    write_u64(out, metrics.deferred_bytes as u64);
 }
 
 fn write_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), CodecError> {
@@ -327,7 +331,9 @@ impl<'a> Reader<'a> {
             entities: self.read_u64()? as usize,
             aoi_candidates: self.read_u64()? as usize,
             selected_updates: self.read_u64()? as usize,
+            deferred_updates: self.read_u64()? as usize,
             bytes_scheduled: self.read_u64()? as usize,
+            deferred_bytes: self.read_u64()? as usize,
         })
     }
 
@@ -436,7 +442,9 @@ mod tests {
             entities: 20,
             aoi_candidates: 30,
             selected_updates: 40,
-            bytes_scheduled: 50,
+            deferred_updates: 50,
+            bytes_scheduled: 60,
+            deferred_bytes: 70,
         });
 
         let encoded = encode_server_message(&message).unwrap();
