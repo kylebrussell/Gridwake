@@ -1,5 +1,7 @@
 # Gridwake
 
+[![CI](https://github.com/kylebrussell/Gridwake/actions/workflows/ci.yml/badge.svg)](https://github.com/kylebrussell/Gridwake/actions/workflows/ci.yml)
+
 Gridwake is an open-source Rust workspace for an engine-neutral, server-authoritative multiplayer runtime. It targets the layer between low-level game networking libraries and full game engines: AOI, replication graph primitives, snapshot deltas, bandwidth budgets, tick scheduling, metrics, and simulation tooling for dense shared-world servers.
 
 The project is intentionally not a renderer, editor, physics engine, matchmaking service, transport library, or hosted backend. Transports and engines should plug into Gridwake instead of being baked into it.
