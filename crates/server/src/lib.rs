@@ -824,6 +824,24 @@ impl ServerRuntime {
             .map(|sample| sample.position)
     }
 
+    pub fn rewind_entity_position_interpolated(
+        &self,
+        entity: EntityId,
+        tick: Tick,
+        sub_tick: f32,
+    ) -> Option<Vec3> {
+        let sub_tick = normalized_sub_tick(sub_tick);
+        let samples = self.lag_history.get(&entity)?;
+        let start = samples.iter().find(|sample| sample.tick == tick)?;
+        if sub_tick == 0.0 || tick.raw() == u64::MAX {
+            return Some(start.position);
+        }
+
+        let next_tick = Tick::new(tick.raw().saturating_add(1));
+        let end = samples.iter().find(|sample| sample.tick == next_tick)?;
+        Some(start.position.lerp(end.position, sub_tick))
+    }
+
     pub fn latest_entity_position_sample(&self, entity: EntityId) -> Option<LagSample> {
         self.lag_history.get(&entity)?.back().copied()
     }
@@ -1149,6 +1167,14 @@ impl ServerRuntime {
                 samples.pop_front();
             }
         }
+    }
+}
+
+fn normalized_sub_tick(sub_tick: f32) -> f32 {
+    if sub_tick.is_finite() {
+        sub_tick.clamp(0.0, 1.0)
+    } else {
+        0.0
     }
 }
 
@@ -1842,6 +1868,49 @@ mod tests {
                 tick: Tick::new(3),
                 position: Vec3::new(3.0, 0.0, 0.0)
             })
+        );
+    }
+
+    #[test]
+    fn lag_history_interpolates_entity_positions_between_ticks() {
+        let mut runtime = ServerRuntime::new(ServerConfig {
+            default_interest_radius: 10.0,
+            per_client_byte_budget: 100,
+            ..ServerConfig::default()
+        });
+        let entity = EntityId::new(1);
+        let mut transport = FakeTransport::default();
+
+        runtime.spawn_entity(
+            entity,
+            Vec3::new(0.0, 0.0, 0.0),
+            payload(entity.raw()),
+            16,
+            1.0,
+        );
+        runtime.advance_tick(&mut transport);
+        runtime.move_entity(entity, Vec3::new(10.0, 5.0, -5.0));
+        runtime.advance_tick(&mut transport);
+
+        assert_eq!(
+            runtime.rewind_entity_position_interpolated(entity, Tick::new(1), 0.5),
+            Some(Vec3::new(5.0, 2.5, -2.5))
+        );
+        assert_eq!(
+            runtime.rewind_entity_position_interpolated(entity, Tick::new(1), -1.0),
+            Some(Vec3::new(0.0, 0.0, 0.0))
+        );
+        assert_eq!(
+            runtime.rewind_entity_position_interpolated(entity, Tick::new(1), 2.0),
+            Some(Vec3::new(10.0, 5.0, -5.0))
+        );
+        assert_eq!(
+            runtime.rewind_entity_position_interpolated(entity, Tick::new(1), f32::NAN),
+            Some(Vec3::new(0.0, 0.0, 0.0))
+        );
+        assert_eq!(
+            runtime.rewind_entity_position_interpolated(entity, Tick::new(2), 0.5),
+            None
         );
     }
 

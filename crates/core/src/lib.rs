@@ -83,6 +83,14 @@ impl Vec3 {
         dx.mul_add(dx, dy.mul_add(dy, dz * dz))
     }
 
+    pub fn lerp(self, other: Self, amount: f32) -> Self {
+        Self {
+            x: self.x + (other.x - self.x) * amount,
+            y: self.y + (other.y - self.y) * amount,
+            z: self.z + (other.z - self.z) * amount,
+        }
+    }
+
     pub fn is_finite(self) -> bool {
         self.x.is_finite() && self.y.is_finite() && self.z.is_finite()
     }
@@ -147,5 +155,13 @@ mod tests {
 
         assert_eq!(tick.advance().raw(), u64::MAX);
         assert_eq!(tick.advance().raw(), u64::MAX);
+    }
+
+    #[test]
+    fn vec3_lerp_interpolates_components() {
+        assert_eq!(
+            Vec3::new(1.0, 2.0, 3.0).lerp(Vec3::new(5.0, 10.0, 15.0), 0.25),
+            Vec3::new(2.0, 4.0, 6.0)
+        );
     }
 }
