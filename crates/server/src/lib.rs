@@ -117,10 +117,65 @@ pub enum CellRoute {
     },
 }
 
+impl CellRoute {
+    pub const fn source_owner(self) -> Option<RegionId> {
+        match self {
+            Self::Local { owner } => Some(owner),
+            Self::CrossRegion { source_owner, .. } => Some(source_owner),
+            Self::Unowned { source_owner, .. } => source_owner,
+        }
+    }
+
+    pub const fn target_owner(self) -> Option<RegionId> {
+        match self {
+            Self::Local { owner } => Some(owner),
+            Self::CrossRegion { target_owner, .. } => Some(target_owner),
+            Self::Unowned { target_owner, .. } => target_owner,
+        }
+    }
+
+    pub const fn is_cross_region(self) -> bool {
+        matches!(self, Self::CrossRegion { .. })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoutedCellEvent {
     pub event: CellEvent,
     pub route: CellRoute,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegionEventBatch {
+    pub target: RegionId,
+    pub events: Vec<RoutedCellEvent>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RegionDispatchMetrics {
+    pub batches: usize,
+    pub events: usize,
+}
+
+pub trait RegionEventSink {
+    fn send_region_events(&mut self, batch: RegionEventBatch);
+}
+
+#[derive(Debug, Default)]
+pub struct MemoryRegionEventSink {
+    pub sent: Vec<RegionEventBatch>,
+}
+
+impl MemoryRegionEventSink {
+    pub fn clear(&mut self) {
+        self.sent.clear();
+    }
+}
+
+impl RegionEventSink for MemoryRegionEventSink {
+    fn send_region_events(&mut self, batch: RegionEventBatch) {
+        self.sent.push(batch);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -510,22 +565,13 @@ impl ServerRuntime {
     ) -> CellRoute {
         let routed = self.route_cell_event(source, target, payload);
         let route = routed.route;
-        match route {
-            CellRoute::Local { owner } => {
-                self.region_cell_events
-                    .entry(owner)
-                    .or_default()
-                    .push(routed);
-            }
-            CellRoute::CrossRegion { target_owner, .. } => {
-                self.region_cell_events
-                    .entry(target_owner)
-                    .or_default()
-                    .push(routed);
-            }
-            CellRoute::Unowned { .. } => {
-                self.unowned_cell_events.push(routed);
-            }
+        if let Some(target_owner) = route.target_owner() {
+            self.region_cell_events
+                .entry(target_owner)
+                .or_default()
+                .push(routed);
+        } else {
+            self.unowned_cell_events.push(routed);
         }
         route
     }
@@ -547,12 +593,43 @@ impl ServerRuntime {
         self.region_cell_events.get(&owner).map_or(0, Vec::len)
     }
 
+    pub fn pending_region_event_targets(&self) -> Vec<RegionId> {
+        let mut targets: Vec<_> = self.region_cell_events.keys().copied().collect();
+        targets.sort_unstable();
+        targets
+    }
+
     pub fn pending_unowned_event_count(&self) -> usize {
         self.unowned_cell_events.len()
     }
 
     pub fn drain_region_events(&mut self, owner: RegionId) -> Vec<RoutedCellEvent> {
         self.region_cell_events.remove(&owner).unwrap_or_default()
+    }
+
+    pub fn drain_region_event_batches(&mut self) -> Vec<RegionEventBatch> {
+        let mut batches: Vec<_> = std::mem::take(&mut self.region_cell_events)
+            .into_iter()
+            .filter(|(_, events)| !events.is_empty())
+            .map(|(target, events)| RegionEventBatch { target, events })
+            .collect();
+        batches.sort_by_key(|batch| batch.target);
+        batches
+    }
+
+    pub fn dispatch_region_events<S: RegionEventSink>(
+        &mut self,
+        sink: &mut S,
+    ) -> RegionDispatchMetrics {
+        let batches = self.drain_region_event_batches();
+        let metrics = RegionDispatchMetrics {
+            batches: batches.len(),
+            events: batches.iter().map(|batch| batch.events.len()).sum(),
+        };
+        for batch in batches {
+            sink.send_region_events(batch);
+        }
+        metrics
     }
 
     pub fn drain_unowned_cell_events(&mut self) -> Vec<RoutedCellEvent> {
@@ -1367,30 +1444,40 @@ mod tests {
         runtime.set_cell_owner(right, region_a);
         runtime.set_cell_owner(far, region_b);
 
+        let local = runtime
+            .route_cell_event(left, right, b"same".to_vec())
+            .route;
+        assert_eq!(local, CellRoute::Local { owner: region_a });
+        assert_eq!(local.source_owner(), Some(region_a));
+        assert_eq!(local.target_owner(), Some(region_a));
+        assert!(!local.is_cross_region());
+
+        let cross = runtime.route_cell_event(left, far, b"cross".to_vec()).route;
         assert_eq!(
-            runtime
-                .route_cell_event(left, right, b"same".to_vec())
-                .route,
-            CellRoute::Local { owner: region_a }
-        );
-        assert_eq!(
-            runtime.route_cell_event(left, far, b"cross".to_vec()).route,
+            cross,
             CellRoute::CrossRegion {
                 source_owner: region_a,
                 target_owner: region_b
             }
         );
+        assert_eq!(cross.source_owner(), Some(region_a));
+        assert_eq!(cross.target_owner(), Some(region_b));
+        assert!(cross.is_cross_region());
 
         runtime.clear_cell_owner(far);
+        let unowned = runtime
+            .route_cell_event(left, far, b"missing".to_vec())
+            .route;
         assert_eq!(
-            runtime
-                .route_cell_event(left, far, b"missing".to_vec())
-                .route,
+            unowned,
             CellRoute::Unowned {
                 source_owner: Some(region_a),
                 target_owner: None
             }
         );
+        assert_eq!(unowned.source_owner(), Some(region_a));
+        assert_eq!(unowned.target_owner(), None);
+        assert!(!unowned.is_cross_region());
     }
 
     #[test]
@@ -1431,6 +1518,10 @@ mod tests {
 
         assert_eq!(runtime.pending_region_event_count(region_a), 1);
         assert_eq!(runtime.pending_region_event_count(region_b), 1);
+        assert_eq!(
+            runtime.pending_region_event_targets(),
+            vec![region_a, region_b]
+        );
         assert_eq!(runtime.pending_unowned_event_count(), 1);
 
         let region_a_events = runtime.drain_region_events(region_a);
@@ -1443,5 +1534,54 @@ mod tests {
         assert_eq!(runtime.pending_region_event_count(region_a), 0);
         assert_eq!(runtime.pending_region_event_count(region_b), 0);
         assert_eq!(runtime.pending_unowned_event_count(), 0);
+    }
+
+    #[test]
+    fn region_event_batches_dispatch_to_sink_and_drain_outboxes() {
+        let mut runtime = ServerRuntime::new(ServerConfig {
+            cell_size: 10.0,
+            ..ServerConfig::default()
+        });
+        let left = runtime.cell_for_position(Vec3::new(1.0, 0.0, 0.0));
+        let right = runtime.cell_for_position(Vec3::new(15.0, 0.0, 0.0));
+        let far = runtime.cell_for_position(Vec3::new(35.0, 0.0, 0.0));
+        let region_a = RegionId::new(1);
+        let region_b = RegionId::new(2);
+        let mut sink = MemoryRegionEventSink::default();
+
+        runtime.set_cell_owner(left, region_a);
+        runtime.set_cell_owner(right, region_a);
+        runtime.set_cell_owner(far, region_b);
+        runtime.enqueue_cell_event(left, far, b"to-b".to_vec());
+        runtime.enqueue_cell_event(left, right, b"to-a".to_vec());
+        runtime.clear_cell_owner(far);
+        runtime.enqueue_cell_event(left, far, b"unowned".to_vec());
+
+        let metrics = runtime.dispatch_region_events(&mut sink);
+
+        assert_eq!(
+            metrics,
+            RegionDispatchMetrics {
+                batches: 2,
+                events: 2
+            }
+        );
+        assert_eq!(sink.sent.len(), 2);
+        assert_eq!(sink.sent[0].target, region_a);
+        assert_eq!(sink.sent[0].events[0].event.payload, b"to-a".to_vec());
+        assert_eq!(sink.sent[1].target, region_b);
+        assert_eq!(sink.sent[1].events[0].event.payload, b"to-b".to_vec());
+        assert_eq!(
+            runtime.pending_region_event_targets(),
+            Vec::<RegionId>::new()
+        );
+        assert_eq!(runtime.pending_unowned_event_count(), 1);
+
+        sink.clear();
+        assert_eq!(
+            runtime.dispatch_region_events(&mut sink),
+            RegionDispatchMetrics::default()
+        );
+        assert!(sink.sent.is_empty());
     }
 }

@@ -11,7 +11,7 @@ The workspace uses crate-level boundaries so each subsystem can be tested indepe
 - `gridwake-replication` tracks client visibility, entity dirty generations, priority accumulation, network LOD byte estimates, and byte-budgeted update selection.
 - `gridwake-snapshot` represents snapshot frames and delta operations without choosing a serializer or transport.
 - `gridwake-protocol` contains transport-neutral messages and a small versioned byte codec.
-- `gridwake-server` composes the crates into an authoritative fixed-step tick shell, adapts byte transports through the protocol codec, pumps inbound client messages, records metrics through sinks, applies selected network LODs to snapshot payloads, retains bounded entity-position history for lag-compensation hooks, and tracks cell ownership for local versus cross-region event routing into region outboxes.
+- `gridwake-server` composes the crates into an authoritative fixed-step tick shell, adapts byte transports through the protocol codec, pumps inbound client messages, records metrics through sinks, applies selected network LODs to snapshot payloads, retains bounded entity-position history for lag-compensation hooks, and tracks cell ownership for local versus cross-region event routing into dispatchable region batches.
 - `gridwake-sim` drives fake clients and entities through deterministic synthetic scenarios using the same fixed-step scheduler and emits text or JSON summaries for repeatable load-test comparisons.
 
 ## Data Flow
@@ -76,6 +76,8 @@ source position/cell + target position/cell
   -> cell owner lookup
   -> local, cross-region, or unowned route
   -> target region outbox or unowned event queue
+  -> sorted region batches
+  -> worker handoff sink
 ```
 
 ## Runtime Principles
@@ -91,13 +93,14 @@ source position/cell + target position/cell
 - Priority accumulation to reduce starvation.
 - Fixed-step scheduling with catch-up caps.
 - Inbound client messages are transport-neutral and pumped before due ticks.
+- Cross-cell events drain through explicit region handoff batches.
 - Lag-compensation history stores authoritative server positions by tick.
 - Deterministic tests where possible.
 - Metrics emitted from the first runnable path, with JSON summaries for scripted load-test comparisons.
 
 ## Near-Term Gaps
 
-- Cell/region ownership has in-process region outboxes; multi-worker dispatch is not implemented yet.
+- Cell/region ownership has dispatchable region batches; durable or networked multi-process delivery is not implemented yet.
 - Snapshot baselines are retained per client and used for runtime deltas; payload-level compression is not implemented yet.
 - Network LOD is explicit per entity; adaptive per-client LOD policy is not implemented yet.
 - Lag-compensation support is exact-position history only; interpolation, hit shapes, and rewind physics are not implemented yet.
