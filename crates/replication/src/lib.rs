@@ -260,6 +260,14 @@ impl ReplicationGraph {
         Some(visible)
     }
 
+    pub fn last_sent_lod(&self, client: ClientId, entity: EntityId) -> Option<NetworkLod> {
+        self.clients
+            .get(&client)?
+            .last_sent_lod
+            .get(&entity)
+            .copied()
+    }
+
     pub fn select_for_client(&mut self, client: ClientId, budget: ByteBudget) -> Selection {
         self.select_for_client_with_lod(client, budget, |_, default_lod| default_lod)
     }
@@ -595,6 +603,7 @@ mod tests {
         assert_eq!(second.updates[0].lod, NetworkLod::Full);
         assert_eq!(second.updates[0].estimated_bytes, 100);
         assert!(!second.updates[0].first_for_client);
+        assert_eq!(graph.last_sent_lod(client, entity), Some(NetworkLod::Full));
         assert!(graph
             .select_for_client_with_lod(client, ByteBudget::new(100), |_, _| { NetworkLod::Full })
             .updates

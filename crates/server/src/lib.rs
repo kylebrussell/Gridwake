@@ -16,6 +16,7 @@ use gridwake_snapshot::{build_delta, AckTracker, DeltaOp, SnapshotFrame, Snapsho
 pub struct NetworkLodPolicy {
     pub full_distance_ratio: f32,
     pub reduced_distance_ratio: f32,
+    pub hysteresis_ratio: f32,
 }
 
 impl Default for NetworkLodPolicy {
@@ -23,6 +24,7 @@ impl Default for NetworkLodPolicy {
         Self {
             full_distance_ratio: 0.35,
             reduced_distance_ratio: 0.75,
+            hysteresis_ratio: 0.05,
         }
     }
 }
@@ -33,22 +35,70 @@ impl NetworkLodPolicy {
         distance_squared: f32,
         interest_radius: f32,
     ) -> NetworkLod {
-        if !distance_squared.is_finite() || !interest_radius.is_finite() || interest_radius <= 0.0 {
+        self.lod_for_distance_squared_with_previous(distance_squared, interest_radius, None)
+    }
+
+    pub fn lod_for_distance_squared_with_previous(
+        self,
+        distance_squared: f32,
+        interest_radius: f32,
+        previous_lod: Option<NetworkLod>,
+    ) -> NetworkLod {
+        if !distance_squared.is_finite()
+            || distance_squared < 0.0
+            || !interest_radius.is_finite()
+            || interest_radius <= 0.0
+        {
             return NetworkLod::Full;
         }
 
         let full_ratio = normalized_ratio(self.full_distance_ratio, 0.35);
         let reduced_ratio = normalized_ratio(self.reduced_distance_ratio, 0.75).max(full_ratio);
-        let full_distance = interest_radius * full_ratio;
-        let reduced_distance = interest_radius * reduced_ratio;
+        let distance_ratio = (distance_squared.sqrt() / interest_radius).clamp(0.0, 1.0);
+        let Some(previous_lod) = previous_lod else {
+            return classify_network_lod(distance_ratio, full_ratio, reduced_ratio);
+        };
+        let hysteresis = normalized_ratio(self.hysteresis_ratio, 0.05);
 
-        if distance_squared <= full_distance * full_distance {
-            NetworkLod::Full
-        } else if distance_squared <= reduced_distance * reduced_distance {
-            NetworkLod::Reduced
-        } else {
-            NetworkLod::Minimal
+        match previous_lod {
+            NetworkLod::Full => {
+                if distance_ratio <= (full_ratio + hysteresis).min(1.0) {
+                    NetworkLod::Full
+                } else if distance_ratio <= (reduced_ratio + hysteresis).min(1.0) {
+                    NetworkLod::Reduced
+                } else {
+                    NetworkLod::Minimal
+                }
+            }
+            NetworkLod::Reduced => {
+                if distance_ratio <= (full_ratio - hysteresis).max(0.0) {
+                    NetworkLod::Full
+                } else if distance_ratio > (reduced_ratio + hysteresis).min(1.0) {
+                    NetworkLod::Minimal
+                } else {
+                    NetworkLod::Reduced
+                }
+            }
+            NetworkLod::Minimal => {
+                if distance_ratio > (reduced_ratio - hysteresis).max(full_ratio) {
+                    NetworkLod::Minimal
+                } else if distance_ratio <= (full_ratio - hysteresis).max(0.0) {
+                    NetworkLod::Full
+                } else {
+                    NetworkLod::Reduced
+                }
+            }
         }
+    }
+}
+
+fn classify_network_lod(distance_ratio: f32, full_ratio: f32, reduced_ratio: f32) -> NetworkLod {
+    if distance_ratio <= full_ratio {
+        NetworkLod::Full
+    } else if distance_ratio <= reduced_ratio {
+        NetworkLod::Reduced
+    } else {
+        NetworkLod::Minimal
     }
 }
 
@@ -1204,10 +1254,15 @@ impl ServerRuntime {
                 continue;
             };
             let distance_squared = client.position.distance_squared(entity.position);
+            let previous_lod = self.replication.last_sent_lod(client.id, *entity_id);
             let lod = self
                 .config
                 .network_lod
-                .lod_for_distance_squared(distance_squared, client.interest_radius);
+                .lod_for_distance_squared_with_previous(
+                    distance_squared,
+                    client.interest_radius,
+                    previous_lod,
+                );
             lod_by_entity.insert(*entity_id, cap_network_lod(entity.lod, lod));
         }
 
@@ -1489,6 +1544,7 @@ mod tests {
             network_lod: NetworkLodPolicy {
                 full_distance_ratio: 0.25,
                 reduced_distance_ratio: 0.50,
+                ..NetworkLodPolicy::default()
             },
             ..ServerConfig::default()
         });
@@ -1535,6 +1591,7 @@ mod tests {
             network_lod: NetworkLodPolicy {
                 full_distance_ratio: 0.25,
                 reduced_distance_ratio: 0.50,
+                ..NetworkLodPolicy::default()
             },
             ..ServerConfig::default()
         });
@@ -1564,6 +1621,51 @@ mod tests {
         assert_eq!(
             snapshot_payload_for(&transport, client, entity),
             b"full".to_vec()
+        );
+    }
+
+    #[test]
+    fn network_lod_hysteresis_prevents_boundary_flapping() {
+        let mut runtime = ServerRuntime::new(ServerConfig {
+            default_interest_radius: 100.0,
+            per_client_byte_budget: 64,
+            network_lod: NetworkLodPolicy {
+                full_distance_ratio: 0.25,
+                reduced_distance_ratio: 0.50,
+                hysteresis_ratio: 0.10,
+            },
+            ..ServerConfig::default()
+        });
+        let client = ClientId::new(1);
+        let entity = EntityId::new(1);
+        let mut transport = FakeTransport::default();
+
+        runtime.connect_client(client, Vec3::new(20.0, 0.0, 0.0), None);
+        runtime.spawn_entity_with_lod_payloads(
+            entity,
+            Vec3::ZERO,
+            NetworkLodPayloads::new(b"full".to_vec(), b"reduced".to_vec(), b"min".to_vec()),
+            1.0,
+            NetworkLod::Full,
+        );
+        runtime.advance_tick(&mut transport);
+        assert_eq!(
+            snapshot_payload_for(&transport, client, entity),
+            b"full".to_vec()
+        );
+        transport.clear();
+
+        assert!(runtime.update_client_position(client, Vec3::new(30.0, 0.0, 0.0)));
+        let stable_metrics = runtime.advance_tick(&mut transport);
+        assert_eq!(stable_metrics.selected_updates, 0);
+        assert!(transport.sent.is_empty());
+
+        assert!(runtime.update_client_position(client, Vec3::new(40.0, 0.0, 0.0)));
+        let changed_metrics = runtime.advance_tick(&mut transport);
+        assert_eq!(changed_metrics.selected_updates, 1);
+        assert_eq!(
+            snapshot_payload_for(&transport, client, entity),
+            b"reduced".to_vec()
         );
     }
 

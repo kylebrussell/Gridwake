@@ -11,7 +11,7 @@ The workspace uses crate-level boundaries so each subsystem can be tested indepe
 - `gridwake-replication` tracks client visibility, entity dirty generations, priority accumulation, per-client network LOD byte estimates, and byte-budgeted update selection.
 - `gridwake-snapshot` represents snapshot frames and delta operations without choosing a serializer or transport.
 - `gridwake-protocol` contains transport-neutral messages and a small versioned byte codec.
-- `gridwake-server` composes the crates into an authoritative fixed-step tick shell, adapts memory or UDP byte transports through the protocol codec, pumps inbound client messages, records metrics through sinks, applies distance-based per-client network LODs to snapshot payloads, reports budget-deferred update pressure, retains bounded entity-position history with exact and interpolated lag-compensation lookup plus rewound sphere-hit validation, and tracks cell ownership for local versus cross-region event routing into dispatchable region batches.
+- `gridwake-server` composes the crates into an authoritative fixed-step tick shell, adapts memory or UDP byte transports through the protocol codec, pumps inbound client messages, records metrics through sinks, applies hysteresis-stabilized per-client network LODs to snapshot payloads, reports budget-deferred update pressure, retains bounded entity-position history with exact and interpolated lag-compensation lookup plus rewound sphere-hit validation, and tracks cell ownership for local versus cross-region event routing into dispatchable region batches.
 - `gridwake-sim` drives fake clients and entities through deterministic synthetic scenarios using the same fixed-step scheduler and emits text or JSON summaries for repeatable load-test comparisons.
 
 ## Data Flow
@@ -27,7 +27,7 @@ game/sim state
 
 The initial runtime sends snapshot delta operations through an in-process fake transport. Runtime history carries forward each client's known state, then diffs it against the latest retained acked baseline so dropped snapshots can be repaired by later deltas. Real transports should implement the same boundary later.
 
-Network LOD is an explicit part of replication selection. Entities can provide full, reduced, and minimal payload variants; the server derives a per-client LOD from client-to-entity distance inside the interest radius, the replication graph budgets the selected variant's byte estimate, and the server inserts that selected payload into the snapshot frame. The entity's configured LOD acts as an upper quality cap, so game code can force an entity down to reduced or minimal detail.
+Network LOD is an explicit part of replication selection. Entities can provide full, reduced, and minimal payload variants; the server derives a per-client LOD from client-to-entity distance inside the interest radius, applies hysteresis using the last LOD sent to that client, the replication graph budgets the selected variant's byte estimate, and the server inserts that selected payload into the snapshot frame. The entity's configured LOD acts as an upper quality cap, so game code can force an entity down to reduced or minimal detail.
 
 The protocol codec is intentionally narrow and dependency-free:
 
@@ -94,7 +94,7 @@ source position/cell + target position/cell
 - AOI filtering before replication scheduling.
 - Byte budgets enforced per client.
 - Budget-deferred updates remain dirty and are surfaced in metrics.
-- Per-client network LOD byte estimates affect scheduling and emitted payloads.
+- Hysteresis-stabilized per-client network LOD byte estimates affect scheduling and emitted payloads.
 - Priority accumulation to reduce starvation.
 - Fixed-step scheduling with catch-up caps.
 - Inbound client messages are transport-neutral and pumped before due ticks.
@@ -107,7 +107,7 @@ source position/cell + target position/cell
 
 - Cell/region ownership has dispatchable region batches; durable or networked multi-process delivery is not implemented yet.
 - Snapshot baselines are retained per client and used for runtime deltas; payload-level compression is not implemented yet.
-- Per-client network LOD is distance-band based; hysteresis, load feedback, and custom policy hooks are not implemented yet.
+- Per-client network LOD is distance-band based with hysteresis; load feedback and custom policy hooks are not implemented yet.
 - Lag-compensation support has exact/interpolated position lookup and sphere-hit validation; full rewind physics and engine collision integration are not implemented yet.
 - A UDP byte adapter exists; production transport integrations, reliability, auth, and session lifecycle are not implemented yet.
 - The simulation harness has deterministic named scenarios, fixed-step ticking, and text/JSON summaries, but still needs sustained benchmark profiles and external visualization.
