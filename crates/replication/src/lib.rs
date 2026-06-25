@@ -10,9 +10,51 @@ pub enum NetworkLod {
     Minimal,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NetworkLodBytes {
+    pub full: usize,
+    pub reduced: usize,
+    pub minimal: usize,
+}
+
+impl NetworkLodBytes {
+    pub fn from_full_bytes(full: usize) -> Self {
+        Self {
+            full,
+            reduced: scaled_bytes(full, 2),
+            minimal: scaled_bytes(full, 4),
+        }
+    }
+
+    pub fn new(full: usize, reduced: usize, minimal: usize) -> Self {
+        Self {
+            full,
+            reduced,
+            minimal,
+        }
+    }
+
+    pub fn for_lod(self, lod: NetworkLod) -> usize {
+        match lod {
+            NetworkLod::Full => self.full,
+            NetworkLod::Reduced => self.reduced,
+            NetworkLod::Minimal => self.minimal,
+        }
+    }
+}
+
+fn scaled_bytes(full: usize, divisor: usize) -> usize {
+    if full == 0 {
+        0
+    } else {
+        full.div_ceil(divisor).max(1)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct EntityReplication {
     pub estimated_bytes: usize,
+    pub lod_bytes: NetworkLodBytes,
     pub base_priority: f32,
     pub lod: NetworkLod,
     generation: u64,
@@ -23,14 +65,30 @@ impl EntityReplication {
         assert!(base_priority.is_finite() && base_priority >= 0.0);
         Self {
             estimated_bytes,
+            lod_bytes: NetworkLodBytes::from_full_bytes(estimated_bytes),
             base_priority,
             lod: NetworkLod::Full,
             generation: 1,
         }
     }
 
+    pub fn with_lod_bytes(lod_bytes: NetworkLodBytes, base_priority: f32, lod: NetworkLod) -> Self {
+        assert!(base_priority.is_finite() && base_priority >= 0.0);
+        Self {
+            estimated_bytes: lod_bytes.full,
+            lod_bytes,
+            base_priority,
+            lod,
+            generation: 1,
+        }
+    }
+
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    pub fn selected_bytes(&self) -> usize {
+        self.lod_bytes.for_lod(self.lod)
     }
 }
 
@@ -45,6 +103,7 @@ pub struct VisibilityChange {
 pub struct SelectedUpdate {
     pub entity: EntityId,
     pub estimated_bytes: usize,
+    pub lod: NetworkLod,
     pub score: f32,
     pub generation: u64,
     pub first_for_client: bool,
@@ -74,6 +133,7 @@ struct ClientReplication {
 struct Candidate {
     entity: EntityId,
     estimated_bytes: usize,
+    lod: NetworkLod,
     score: f32,
     generation: u64,
     first_for_client: bool,
@@ -93,16 +153,44 @@ impl ReplicationGraph {
     }
 
     pub fn upsert_entity(&mut self, entity: EntityId, estimated_bytes: usize, base_priority: f32) {
+        self.upsert_entity_with_lod_bytes(
+            entity,
+            NetworkLodBytes::from_full_bytes(estimated_bytes),
+            base_priority,
+            NetworkLod::Full,
+        );
+    }
+
+    pub fn upsert_entity_with_lod_bytes(
+        &mut self,
+        entity: EntityId,
+        lod_bytes: NetworkLodBytes,
+        base_priority: f32,
+        lod: NetworkLod,
+    ) {
         if let Some(existing) = self.entities.get_mut(&entity) {
-            existing.estimated_bytes = estimated_bytes;
+            existing.estimated_bytes = lod_bytes.full;
+            existing.lod_bytes = lod_bytes;
             existing.base_priority = base_priority;
+            existing.lod = lod;
             existing.generation = existing.generation.saturating_add(1);
         } else {
             self.entities.insert(
                 entity,
-                EntityReplication::new(estimated_bytes, base_priority),
+                EntityReplication::with_lod_bytes(lod_bytes, base_priority, lod),
             );
         }
+    }
+
+    pub fn set_entity_lod(&mut self, entity: EntityId, lod: NetworkLod) -> bool {
+        let Some(entity) = self.entities.get_mut(&entity) else {
+            return false;
+        };
+        if entity.lod != lod {
+            entity.lod = lod;
+            entity.generation = entity.generation.saturating_add(1);
+        }
+        true
     }
 
     pub fn remove_entity(&mut self, entity: EntityId) -> bool {
@@ -194,7 +282,8 @@ impl ReplicationGraph {
             *accumulator += entity.base_priority;
             candidates.push(Candidate {
                 entity: entity_id,
-                estimated_bytes: entity.estimated_bytes,
+                estimated_bytes: entity.selected_bytes(),
+                lod: entity.lod,
                 score: *accumulator,
                 generation: entity.generation,
                 first_for_client: last_sent == 0,
@@ -225,6 +314,7 @@ impl ReplicationGraph {
             updates.push(SelectedUpdate {
                 entity: candidate.entity,
                 estimated_bytes: candidate.estimated_bytes,
+                lod: candidate.lod,
                 score: candidate.score,
                 generation: candidate.generation,
                 first_for_client: candidate.first_for_client,
@@ -338,5 +428,82 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn network_lod_uses_lod_specific_byte_budget() {
+        let mut graph = ReplicationGraph::new();
+        let client = ClientId::new(1);
+        let full = EntityId::new(1);
+        let reduced = EntityId::new(2);
+        let minimal = EntityId::new(3);
+
+        graph.register_client(client);
+        graph.upsert_entity_with_lod_bytes(
+            full,
+            NetworkLodBytes::new(100, 50, 25),
+            1.0,
+            NetworkLod::Full,
+        );
+        graph.upsert_entity_with_lod_bytes(
+            reduced,
+            NetworkLodBytes::new(100, 50, 25),
+            1.0,
+            NetworkLod::Reduced,
+        );
+        graph.upsert_entity_with_lod_bytes(
+            minimal,
+            NetworkLodBytes::new(100, 50, 25),
+            1.0,
+            NetworkLod::Minimal,
+        );
+        graph.set_visibility(client, [full, reduced, minimal]);
+
+        let selection = graph.select_for_client(client, ByteBudget::new(75));
+
+        assert_eq!(selection.bytes_used, 75);
+        assert_eq!(selection.updates.len(), 2);
+        assert!(selection
+            .updates
+            .iter()
+            .any(|update| update.entity == reduced
+                && update.lod == NetworkLod::Reduced
+                && update.estimated_bytes == 50));
+        assert!(selection
+            .updates
+            .iter()
+            .any(|update| update.entity == minimal
+                && update.lod == NetworkLod::Minimal
+                && update.estimated_bytes == 25));
+        assert!(!selection.updates.iter().any(|update| update.entity == full));
+    }
+
+    #[test]
+    fn changing_lod_marks_entity_dirty() {
+        let mut graph = ReplicationGraph::new();
+        let client = ClientId::new(1);
+        let entity = EntityId::new(1);
+
+        graph.register_client(client);
+        graph.upsert_entity_with_lod_bytes(
+            entity,
+            NetworkLodBytes::new(100, 40, 10),
+            1.0,
+            NetworkLod::Minimal,
+        );
+        graph.set_visibility(client, [entity]);
+
+        let first = graph.select_for_client(client, ByteBudget::new(10));
+        assert_eq!(first.updates[0].lod, NetworkLod::Minimal);
+        assert!(graph
+            .select_for_client(client, ByteBudget::new(100))
+            .updates
+            .is_empty());
+
+        assert!(graph.set_entity_lod(entity, NetworkLod::Full));
+        let second = graph.select_for_client(client, ByteBudget::new(100));
+        assert_eq!(second.updates.len(), 1);
+        assert_eq!(second.updates[0].lod, NetworkLod::Full);
+        assert_eq!(second.updates[0].estimated_bytes, 100);
     }
 }

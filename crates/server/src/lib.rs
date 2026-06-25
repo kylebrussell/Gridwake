@@ -7,7 +7,7 @@ use gridwake_protocol::{
     decode_client_message_with_config, encode_client_message, encode_server_message, ClientMessage,
     CodecError, DecodeConfig, MetricsFrame, RoutedClientMessage, ServerMessage,
 };
-use gridwake_replication::{ReplicationGraph, VisibilityChange};
+use gridwake_replication::{NetworkLod, NetworkLodBytes, ReplicationGraph, VisibilityChange};
 use gridwake_snapshot::{build_delta, AckTracker, DeltaOp, SnapshotFrame, SnapshotHistory};
 
 #[derive(Clone, Copy, Debug)]
@@ -45,8 +45,54 @@ pub struct ServerEntity {
     pub id: EntityId,
     pub position: Vec3,
     pub payload: Vec<u8>,
+    pub reduced_payload: Vec<u8>,
+    pub minimal_payload: Vec<u8>,
     pub estimated_bytes: usize,
     pub base_priority: f32,
+    pub lod: NetworkLod,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetworkLodPayloads {
+    pub full: Vec<u8>,
+    pub reduced: Vec<u8>,
+    pub minimal: Vec<u8>,
+}
+
+impl NetworkLodPayloads {
+    pub fn new(
+        full_payload: impl Into<Vec<u8>>,
+        reduced_payload: impl Into<Vec<u8>>,
+        minimal_payload: impl Into<Vec<u8>>,
+    ) -> Self {
+        Self {
+            full: full_payload.into(),
+            reduced: reduced_payload.into(),
+            minimal: minimal_payload.into(),
+        }
+    }
+
+    fn lod_bytes(&self) -> NetworkLodBytes {
+        NetworkLodBytes::new(self.full.len(), self.reduced.len(), self.minimal.len())
+    }
+}
+
+impl ServerEntity {
+    fn payload_for_lod(&self, lod: NetworkLod) -> Vec<u8> {
+        match lod {
+            NetworkLod::Full => self.payload.clone(),
+            NetworkLod::Reduced => self.reduced_payload.clone(),
+            NetworkLod::Minimal => self.minimal_payload.clone(),
+        }
+    }
+
+    fn lod_bytes(&self) -> NetworkLodBytes {
+        NetworkLodBytes::new(
+            self.payload.len(),
+            self.reduced_payload.len(),
+            self.minimal_payload.len(),
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -562,17 +608,47 @@ impl ServerRuntime {
     ) {
         let payload = payload.into();
         let estimated_bytes = estimated_bytes.max(payload.len());
+        let reduced_payload = payload.clone();
+        let minimal_payload = payload.clone();
         let entity = ServerEntity {
             id,
             position,
-            payload,
+            payload: payload.clone(),
+            reduced_payload,
+            minimal_payload,
             estimated_bytes,
             base_priority,
+            lod: NetworkLod::Full,
         };
         self.entities.insert(id, entity);
         self.aoi.insert_entity(id, position);
         self.replication
             .upsert_entity(id, estimated_bytes, base_priority);
+    }
+
+    pub fn spawn_entity_with_lod_payloads(
+        &mut self,
+        id: EntityId,
+        position: Vec3,
+        payloads: NetworkLodPayloads,
+        base_priority: f32,
+        lod: NetworkLod,
+    ) {
+        let lod_bytes = payloads.lod_bytes();
+        let entity = ServerEntity {
+            id,
+            position,
+            payload: payloads.full,
+            reduced_payload: payloads.reduced,
+            minimal_payload: payloads.minimal,
+            estimated_bytes: lod_bytes.full,
+            base_priority,
+            lod,
+        };
+        self.entities.insert(id, entity);
+        self.aoi.insert_entity(id, position);
+        self.replication
+            .upsert_entity_with_lod_bytes(id, lod_bytes, base_priority, lod);
     }
 
     pub fn despawn_entity(&mut self, id: EntityId) -> bool {
@@ -595,9 +671,49 @@ impl ServerRuntime {
         let Some(entity) = self.entities.get_mut(&id) else {
             return false;
         };
-        entity.payload = payload.into();
-        entity.estimated_bytes = entity.estimated_bytes.max(entity.payload.len());
-        self.replication.mark_dirty(id)
+        let payload = payload.into();
+        entity.payload = payload.clone();
+        entity.reduced_payload = payload.clone();
+        entity.minimal_payload = payload;
+        entity.estimated_bytes = entity.payload.len();
+        self.replication.upsert_entity_with_lod_bytes(
+            id,
+            entity.lod_bytes(),
+            entity.base_priority,
+            entity.lod,
+        );
+        true
+    }
+
+    pub fn set_entity_lod_payloads(
+        &mut self,
+        id: EntityId,
+        full_payload: impl Into<Vec<u8>>,
+        reduced_payload: impl Into<Vec<u8>>,
+        minimal_payload: impl Into<Vec<u8>>,
+    ) -> bool {
+        let Some(entity) = self.entities.get_mut(&id) else {
+            return false;
+        };
+        entity.payload = full_payload.into();
+        entity.reduced_payload = reduced_payload.into();
+        entity.minimal_payload = minimal_payload.into();
+        entity.estimated_bytes = entity.payload.len();
+        self.replication.upsert_entity_with_lod_bytes(
+            id,
+            entity.lod_bytes(),
+            entity.base_priority,
+            entity.lod,
+        );
+        true
+    }
+
+    pub fn set_entity_lod(&mut self, id: EntityId, lod: NetworkLod) -> bool {
+        let Some(entity) = self.entities.get_mut(&id) else {
+            return false;
+        };
+        entity.lod = lod;
+        self.replication.set_entity_lod(id, lod)
     }
 
     pub fn receive(&mut self, client: ClientId, message: ClientMessage) {
@@ -731,7 +847,7 @@ impl ServerRuntime {
 
         for update in updates {
             if let Some(entity) = self.entities.get(&update.entity) {
-                frame.insert(update.entity, entity.payload.clone());
+                frame.insert(update.entity, entity.payload_for_lod(update.lod));
             }
         }
         frame
@@ -810,6 +926,83 @@ mod tests {
             panic!("expected snapshot delta");
         };
         assert_eq!(delta.ops[0].entity(), high);
+    }
+
+    #[test]
+    fn tick_uses_selected_network_lod_payload() {
+        let mut runtime = ServerRuntime::new(ServerConfig {
+            default_interest_radius: 100.0,
+            per_client_byte_budget: 8,
+            ..ServerConfig::default()
+        });
+        let client = ClientId::new(1);
+        let entity = EntityId::new(1);
+        let mut transport = FakeTransport::default();
+
+        runtime.connect_client(client, Vec3::ZERO, None);
+        runtime.spawn_entity_with_lod_payloads(
+            entity,
+            Vec3::ZERO,
+            NetworkLodPayloads::new(
+                b"full-payload-too-large".to_vec(),
+                b"reduced".to_vec(),
+                b"min".to_vec(),
+            ),
+            1.0,
+            NetworkLod::Reduced,
+        );
+
+        let metrics = runtime.advance_tick(&mut transport);
+
+        assert_eq!(metrics.selected_updates, 1);
+        assert_eq!(metrics.bytes_scheduled, b"reduced".len());
+        let ServerMessage::SnapshotDelta(delta) = &transport.sent[0].1 else {
+            panic!("expected snapshot delta");
+        };
+        assert_eq!(
+            delta.ops,
+            vec![DeltaOp::SpawnOrEnter {
+                entity,
+                payload: b"reduced".to_vec()
+            }]
+        );
+    }
+
+    #[test]
+    fn changing_server_entity_lod_marks_it_dirty() {
+        let mut runtime = ServerRuntime::new(ServerConfig {
+            default_interest_radius: 100.0,
+            per_client_byte_budget: 64,
+            ..ServerConfig::default()
+        });
+        let client = ClientId::new(1);
+        let entity = EntityId::new(1);
+        let mut transport = FakeTransport::default();
+
+        runtime.connect_client(client, Vec3::ZERO, None);
+        runtime.spawn_entity_with_lod_payloads(
+            entity,
+            Vec3::ZERO,
+            NetworkLodPayloads::new(b"full".to_vec(), b"reduced".to_vec(), b"min".to_vec()),
+            1.0,
+            NetworkLod::Minimal,
+        );
+        runtime.advance_tick(&mut transport);
+        transport.clear();
+
+        assert!(runtime.set_entity_lod(entity, NetworkLod::Full));
+        runtime.advance_tick(&mut transport);
+
+        let ServerMessage::SnapshotDelta(delta) = &transport.sent[0].1 else {
+            panic!("expected snapshot delta");
+        };
+        assert_eq!(
+            delta.ops,
+            vec![DeltaOp::SpawnOrEnter {
+                entity,
+                payload: b"full".to_vec()
+            }]
+        );
     }
 
     #[test]

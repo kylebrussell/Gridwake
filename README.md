@@ -10,10 +10,10 @@ The project is intentionally not a renderer, editor, physics engine, matchmaking
 | --- | --- |
 | `gridwake-core` | Shared ids, ticks, sequence ids, byte budgets, and math-neutral position types. |
 | `gridwake-aoi` | Spatial interest management with a grid-backed AOI index. |
-| `gridwake-replication` | Per-client visibility, dirty generations, priority accumulation, and byte-budgeted selection. |
+| `gridwake-replication` | Per-client visibility, dirty generations, priority accumulation, network LOD byte estimates, and byte-budgeted selection. |
 | `gridwake-snapshot` | Snapshot frames, delta ops, retained baseline history, and ack tracking. |
 | `gridwake-protocol` | Transport-neutral client/server message enums, metric frames, and a versioned byte codec. |
-| `gridwake-server` | Authoritative runtime shell using fake/codec transports, inbound message pumping, fixed-step scheduling, metrics sinks, AOI, replication, acked snapshot deltas, bounded lag-history hooks, cell ownership, and cross-cell event outboxes. |
+| `gridwake-server` | Authoritative runtime shell using fake/codec transports, inbound message pumping, fixed-step scheduling, metrics sinks, AOI, LOD-aware replication payloads, acked snapshot deltas, bounded lag-history hooks, cell ownership, and cross-cell event outboxes. |
 | `gridwake-sim` | Runnable load-test harness with fake clients, fake entities, fixed-step ticks, and named synthetic scenarios. |
 
 ## Adjacent Projects
@@ -56,7 +56,7 @@ Gridwake is dual-licensed under MIT OR Apache-2.0.
 
 1. Scaffold the workspace, docs, CI-ready commands, and publishable crate namespace.
 2. Implement grid AOI with observer/entity insert, update, remove, and interest queries.
-3. Implement replication graph selection with priority accumulation and per-client byte budgets.
+3. Implement replication graph selection with priority accumulation, per-client byte budgets, and network LOD payload selection.
 4. Add snapshot/delta baselines and ack handling.
 5. Expand the simulation harness into larger repeatable benchmark scenarios.
 6. Grow in-process cell-event outboxes into real multi-worker handoff and cross-cell delivery infrastructure.
