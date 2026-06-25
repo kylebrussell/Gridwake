@@ -1500,6 +1500,46 @@ mod tests {
     }
 
     #[test]
+    fn tick_falls_back_to_lower_lod_when_desired_payload_exceeds_budget() {
+        let mut runtime = ServerRuntime::new(ServerConfig {
+            default_interest_radius: 100.0,
+            per_client_byte_budget: 8,
+            network_lod: NetworkLodPolicy {
+                full_distance_ratio: 1.0,
+                reduced_distance_ratio: 1.0,
+                hysteresis_ratio: 0.0,
+            },
+            ..ServerConfig::default()
+        });
+        let client = ClientId::new(1);
+        let entity = EntityId::new(1);
+        let mut transport = FakeTransport::default();
+
+        runtime.connect_client(client, Vec3::ZERO, None);
+        runtime.spawn_entity_with_lod_payloads(
+            entity,
+            Vec3::ZERO,
+            NetworkLodPayloads::new(
+                b"full-payload-too-large".to_vec(),
+                b"reduced".to_vec(),
+                b"min".to_vec(),
+            ),
+            1.0,
+            NetworkLod::Full,
+        );
+
+        let metrics = runtime.advance_tick(&mut transport);
+
+        assert_eq!(metrics.selected_updates, 1);
+        assert_eq!(metrics.deferred_updates, 0);
+        assert_eq!(metrics.bytes_scheduled, b"reduced".len());
+        assert_eq!(
+            snapshot_payload_for(&transport, client, entity),
+            b"reduced".to_vec()
+        );
+    }
+
+    #[test]
     fn changing_server_entity_lod_marks_it_dirty() {
         let mut runtime = ServerRuntime::new(ServerConfig {
             default_interest_radius: 100.0,

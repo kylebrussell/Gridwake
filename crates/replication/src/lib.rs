@@ -10,6 +10,24 @@ pub enum NetworkLod {
     Minimal,
 }
 
+impl NetworkLod {
+    fn detail_rank(self) -> u8 {
+        match self {
+            Self::Full => 3,
+            Self::Reduced => 2,
+            Self::Minimal => 1,
+        }
+    }
+}
+
+fn lod_fallbacks(lod: NetworkLod) -> &'static [NetworkLod] {
+    match lod {
+        NetworkLod::Full => &[NetworkLod::Full, NetworkLod::Reduced, NetworkLod::Minimal],
+        NetworkLod::Reduced => &[NetworkLod::Reduced, NetworkLod::Minimal],
+        NetworkLod::Minimal => &[NetworkLod::Minimal],
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NetworkLodBytes {
     pub full: usize,
@@ -136,9 +154,12 @@ struct ClientReplication {
 struct Candidate {
     entity: EntityId,
     estimated_bytes: usize,
+    lod_bytes: NetworkLodBytes,
     lod: NetworkLod,
     score: f32,
     generation: u64,
+    last_sent_generation: u64,
+    last_sent_lod: Option<NetworkLod>,
     first_for_client: bool,
 }
 
@@ -307,9 +328,12 @@ impl ReplicationGraph {
             candidates.push(Candidate {
                 entity: entity_id,
                 estimated_bytes: entity.lod_bytes.for_lod(lod),
+                lod_bytes: entity.lod_bytes,
                 lod,
                 score: *accumulator,
                 generation: entity.generation,
+                last_sent_generation: last_sent,
+                last_sent_lod,
                 first_for_client: last_sent == 0,
             });
         }
@@ -327,11 +351,12 @@ impl ReplicationGraph {
         let mut deferred_updates = 0;
         let mut deferred_bytes: usize = 0;
         for candidate in candidates {
-            if !budget.try_reserve(candidate.estimated_bytes) {
+            let Some((lod, bytes)) = select_lod_for_budget(&candidate, budget.remaining()) else {
                 deferred_updates += 1;
                 deferred_bytes = deferred_bytes.saturating_add(candidate.estimated_bytes);
                 continue;
-            }
+            };
+            debug_assert!(budget.try_reserve(bytes));
 
             client_state
                 .priority_accumulator
@@ -339,13 +364,11 @@ impl ReplicationGraph {
             client_state
                 .last_sent_generation
                 .insert(candidate.entity, candidate.generation);
-            client_state
-                .last_sent_lod
-                .insert(candidate.entity, candidate.lod);
+            client_state.last_sent_lod.insert(candidate.entity, lod);
             updates.push(SelectedUpdate {
                 entity: candidate.entity,
-                estimated_bytes: candidate.estimated_bytes,
-                lod: candidate.lod,
+                estimated_bytes: bytes,
+                lod,
                 score: candidate.score,
                 generation: candidate.generation,
                 first_for_client: candidate.first_for_client,
@@ -360,6 +383,31 @@ impl ReplicationGraph {
             deferred_bytes,
         }
     }
+}
+
+fn select_lod_for_budget(
+    candidate: &Candidate,
+    bytes_remaining: usize,
+) -> Option<(NetworkLod, usize)> {
+    for &lod in lod_fallbacks(candidate.lod) {
+        let bytes = candidate.lod_bytes.for_lod(lod);
+        if bytes > bytes_remaining {
+            continue;
+        }
+
+        if candidate.generation <= candidate.last_sent_generation {
+            if let Some(last_sent_lod) = candidate.last_sent_lod {
+                let waiting_for_upgrade = candidate.lod.detail_rank() > last_sent_lod.detail_rank();
+                if waiting_for_upgrade && lod.detail_rank() <= last_sent_lod.detail_rank() {
+                    return None;
+                }
+            }
+        }
+
+        return Some((lod, bytes));
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -499,20 +547,20 @@ mod tests {
         assert_eq!(selection.bytes_used, 75);
         assert_eq!(selection.updates.len(), 2);
         assert_eq!(selection.deferred_updates, 1);
-        assert_eq!(selection.deferred_bytes, 100);
+        assert_eq!(selection.deferred_bytes, 25);
+        assert!(selection.updates.iter().any(|update| update.entity == full
+            && update.lod == NetworkLod::Reduced
+            && update.estimated_bytes == 50));
         assert!(selection
             .updates
             .iter()
             .any(|update| update.entity == reduced
-                && update.lod == NetworkLod::Reduced
-                && update.estimated_bytes == 50));
-        assert!(selection
-            .updates
-            .iter()
-            .any(|update| update.entity == minimal
                 && update.lod == NetworkLod::Minimal
                 && update.estimated_bytes == 25));
-        assert!(!selection.updates.iter().any(|update| update.entity == full));
+        assert!(!selection
+            .updates
+            .iter()
+            .any(|update| update.entity == minimal));
     }
 
     #[test]
@@ -560,7 +608,7 @@ mod tests {
         graph.set_visibility(client, [entity]);
 
         assert!(graph
-            .select_for_client(client, ByteBudget::new(10))
+            .select_for_client(client, ByteBudget::new(9))
             .updates
             .is_empty());
 
@@ -571,6 +619,68 @@ mod tests {
         assert_eq!(selection.updates.len(), 1);
         assert_eq!(selection.updates[0].lod, NetworkLod::Minimal);
         assert_eq!(selection.updates[0].estimated_bytes, 10);
+    }
+
+    #[test]
+    fn selection_falls_back_to_lower_lod_when_desired_lod_exceeds_budget() {
+        let mut graph = ReplicationGraph::new();
+        let client = ClientId::new(1);
+        let entity = EntityId::new(1);
+
+        graph.register_client(client);
+        graph.upsert_entity_with_lod_bytes(
+            entity,
+            NetworkLodBytes::new(100, 40, 10),
+            1.0,
+            NetworkLod::Full,
+        );
+        graph.set_visibility(client, [entity]);
+
+        let selection = graph.select_for_client(client, ByteBudget::new(40));
+
+        assert_eq!(selection.bytes_used, 40);
+        assert_eq!(selection.deferred_updates, 0);
+        assert_eq!(selection.updates.len(), 1);
+        assert_eq!(selection.updates[0].lod, NetworkLod::Reduced);
+        assert_eq!(selection.updates[0].estimated_bytes, 40);
+    }
+
+    #[test]
+    fn clean_upgrade_waits_for_budget_without_resending_existing_lower_lod() {
+        let mut graph = ReplicationGraph::new();
+        let client = ClientId::new(1);
+        let entity = EntityId::new(1);
+
+        graph.register_client(client);
+        graph.upsert_entity_with_lod_bytes(
+            entity,
+            NetworkLodBytes::new(100, 40, 10),
+            1.0,
+            NetworkLod::Full,
+        );
+        graph.set_visibility(client, [entity]);
+
+        let first = graph.select_for_client(client, ByteBudget::new(40));
+        assert_eq!(first.updates[0].lod, NetworkLod::Reduced);
+        assert_eq!(
+            graph.select_for_client(client, ByteBudget::new(40)),
+            Selection {
+                updates: Vec::new(),
+                bytes_used: 0,
+                bytes_remaining: 40,
+                deferred_updates: 1,
+                deferred_bytes: 100,
+            }
+        );
+
+        graph.mark_dirty(entity);
+        let dirty = graph.select_for_client(client, ByteBudget::new(40));
+        assert_eq!(dirty.updates.len(), 1);
+        assert_eq!(dirty.updates[0].lod, NetworkLod::Reduced);
+
+        let upgraded = graph.select_for_client(client, ByteBudget::new(100));
+        assert_eq!(upgraded.updates.len(), 1);
+        assert_eq!(upgraded.updates[0].lod, NetworkLod::Full);
     }
 
     #[test]
