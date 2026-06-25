@@ -341,6 +341,9 @@ pub struct TickMetrics {
     pub entities: usize,
     pub aoi_candidates: usize,
     pub selected_updates: usize,
+    pub selected_full_lod_updates: usize,
+    pub selected_reduced_lod_updates: usize,
+    pub selected_minimal_lod_updates: usize,
     pub deferred_updates: usize,
     pub exit_updates: usize,
     pub bytes_scheduled: usize,
@@ -356,6 +359,9 @@ impl From<TickMetrics> for MetricsFrame {
             entities: metrics.entities,
             aoi_candidates: metrics.aoi_candidates,
             selected_updates: metrics.selected_updates,
+            selected_full_lod_updates: metrics.selected_full_lod_updates,
+            selected_reduced_lod_updates: metrics.selected_reduced_lod_updates,
+            selected_minimal_lod_updates: metrics.selected_minimal_lod_updates,
             deferred_updates: metrics.deferred_updates,
             bytes_scheduled: metrics.bytes_scheduled,
             deferred_bytes: metrics.deferred_bytes,
@@ -1160,6 +1166,13 @@ impl ServerRuntime {
             );
 
             metrics.selected_updates += selection.updates.len();
+            for update in &selection.updates {
+                match update.lod {
+                    NetworkLod::Full => metrics.selected_full_lod_updates += 1,
+                    NetworkLod::Reduced => metrics.selected_reduced_lod_updates += 1,
+                    NetworkLod::Minimal => metrics.selected_minimal_lod_updates += 1,
+                }
+            }
             metrics.deferred_updates += selection.deferred_updates;
             metrics.deferred_bytes = metrics
                 .deferred_bytes
@@ -1520,6 +1533,9 @@ mod tests {
         let metrics = runtime.advance_tick(&mut transport);
 
         assert_eq!(metrics.selected_updates, 1);
+        assert_eq!(metrics.selected_full_lod_updates, 0);
+        assert_eq!(metrics.selected_reduced_lod_updates, 1);
+        assert_eq!(metrics.selected_minimal_lod_updates, 0);
         assert_eq!(metrics.bytes_scheduled, b"reduced".len());
         let ServerMessage::SnapshotDelta(delta) = &transport.sent[0].1 else {
             panic!("expected snapshot delta");
@@ -1565,6 +1581,9 @@ mod tests {
         let metrics = runtime.advance_tick(&mut transport);
 
         assert_eq!(metrics.selected_updates, 1);
+        assert_eq!(metrics.selected_full_lod_updates, 0);
+        assert_eq!(metrics.selected_reduced_lod_updates, 1);
+        assert_eq!(metrics.selected_minimal_lod_updates, 0);
         assert_eq!(metrics.deferred_updates, 0);
         assert_eq!(metrics.bytes_scheduled, b"reduced".len());
         assert_eq!(
@@ -1642,6 +1661,9 @@ mod tests {
         let metrics = runtime.advance_tick(&mut transport);
 
         assert_eq!(metrics.selected_updates, 3);
+        assert_eq!(metrics.selected_full_lod_updates, 1);
+        assert_eq!(metrics.selected_reduced_lod_updates, 1);
+        assert_eq!(metrics.selected_minimal_lod_updates, 1);
         assert_eq!(transport.sent.len(), 3);
         assert_eq!(
             snapshot_payload_for(&transport, near_client, entity),
@@ -1696,6 +1718,9 @@ mod tests {
         });
 
         assert_eq!(metrics.selected_updates, 1);
+        assert_eq!(metrics.selected_full_lod_updates, 0);
+        assert_eq!(metrics.selected_reduced_lod_updates, 0);
+        assert_eq!(metrics.selected_minimal_lod_updates, 1);
         assert_eq!(
             snapshot_payload_for(&transport, client, entity),
             b"min".to_vec()
@@ -1722,8 +1747,12 @@ mod tests {
             NetworkLod::Reduced,
         );
 
-        runtime.advance_tick_with_network_lod_selector(&mut transport, |_| NetworkLod::Full);
+        let metrics =
+            runtime.advance_tick_with_network_lod_selector(&mut transport, |_| NetworkLod::Full);
 
+        assert_eq!(metrics.selected_full_lod_updates, 0);
+        assert_eq!(metrics.selected_reduced_lod_updates, 1);
+        assert_eq!(metrics.selected_minimal_lod_updates, 0);
         assert_eq!(
             snapshot_payload_for(&transport, client, entity),
             b"reduced".to_vec()
@@ -2110,6 +2139,9 @@ mod tests {
             entities: 2,
             aoi_candidates: 3,
             selected_updates: 4,
+            selected_full_lod_updates: 1,
+            selected_reduced_lod_updates: 2,
+            selected_minimal_lod_updates: 1,
             deferred_updates: 5,
             bytes_scheduled: 6,
             deferred_bytes: 7,

@@ -4,7 +4,7 @@ use gridwake_core::{ClientId, EntityId, SnapshotId, Tick};
 use gridwake_snapshot::{DeltaOp, DeltaSnapshot};
 
 pub const PROTOCOL_MAGIC: [u8; 2] = *b"GW";
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClientMessage {
@@ -25,6 +25,9 @@ pub struct MetricsFrame {
     pub entities: usize,
     pub aoi_candidates: usize,
     pub selected_updates: usize,
+    pub selected_full_lod_updates: usize,
+    pub selected_reduced_lod_updates: usize,
+    pub selected_minimal_lod_updates: usize,
     pub deferred_updates: usize,
     pub bytes_scheduled: usize,
     pub deferred_bytes: usize,
@@ -228,6 +231,9 @@ fn write_metrics(out: &mut Vec<u8>, metrics: &MetricsFrame) {
     write_u64(out, metrics.entities as u64);
     write_u64(out, metrics.aoi_candidates as u64);
     write_u64(out, metrics.selected_updates as u64);
+    write_u64(out, metrics.selected_full_lod_updates as u64);
+    write_u64(out, metrics.selected_reduced_lod_updates as u64);
+    write_u64(out, metrics.selected_minimal_lod_updates as u64);
     write_u64(out, metrics.deferred_updates as u64);
     write_u64(out, metrics.bytes_scheduled as u64);
     write_u64(out, metrics.deferred_bytes as u64);
@@ -331,6 +337,9 @@ impl<'a> Reader<'a> {
             entities: self.read_u64()? as usize,
             aoi_candidates: self.read_u64()? as usize,
             selected_updates: self.read_u64()? as usize,
+            selected_full_lod_updates: self.read_u64()? as usize,
+            selected_reduced_lod_updates: self.read_u64()? as usize,
+            selected_minimal_lod_updates: self.read_u64()? as usize,
             deferred_updates: self.read_u64()? as usize,
             bytes_scheduled: self.read_u64()? as usize,
             deferred_bytes: self.read_u64()? as usize,
@@ -442,6 +451,9 @@ mod tests {
             entities: 20,
             aoi_candidates: 30,
             selected_updates: 40,
+            selected_full_lod_updates: 11,
+            selected_reduced_lod_updates: 12,
+            selected_minimal_lod_updates: 13,
             deferred_updates: 50,
             bytes_scheduled: 60,
             deferred_bytes: 70,

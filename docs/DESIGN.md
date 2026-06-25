@@ -11,7 +11,7 @@ The workspace uses crate-level boundaries so each subsystem can be tested indepe
 - `gridwake-replication` tracks client visibility, entity dirty generations, priority accumulation, per-client network LOD byte estimates, and byte-budgeted update selection.
 - `gridwake-snapshot` represents snapshot frames and delta operations without choosing a serializer or transport.
 - `gridwake-protocol` contains transport-neutral messages and a small versioned byte codec.
-- `gridwake-server` composes the crates into an authoritative fixed-step tick shell, adapts memory or UDP byte transports through the protocol codec, pumps inbound client messages, records metrics through sinks, applies customizable budget-aware hysteresis-stabilized per-client network LODs to snapshot payloads, reports budget-deferred update pressure, retains bounded entity-position history with exact and interpolated lag-compensation lookup plus rewound sphere-hit validation, and tracks cell ownership for local versus cross-region event routing into dispatchable region batches.
+- `gridwake-server` composes the crates into an authoritative fixed-step tick shell, adapts memory or UDP byte transports through the protocol codec, pumps inbound client messages, records metrics through sinks, applies customizable budget-aware hysteresis-stabilized per-client network LODs to snapshot payloads, reports per-LOD and budget-deferred update pressure, retains bounded entity-position history with exact and interpolated lag-compensation lookup plus rewound sphere-hit validation, and tracks cell ownership for local versus cross-region event routing into dispatchable region batches.
 - `gridwake-sim` drives fake clients and entities through deterministic synthetic scenarios using the same fixed-step scheduler and emits text or JSON summaries for repeatable load-test comparisons.
 
 ## Data Flow
@@ -60,7 +60,7 @@ elapsed time
   -> record tick metrics
 ```
 
-Simulation reports include per-tick runtime and step timing, AOI candidates, selected updates, budget-deferred updates, exits, bytes scheduled, deferred bytes, messages sent, average AOI set size per client, and bytes per client. Summary reports include average and max runtime duration plus client-normalized AOI, bandwidth, and budget-pressure metrics.
+Simulation reports include per-tick runtime and step timing, AOI candidates, selected updates, selected full/reduced/minimal LOD counts, budget-deferred updates, exits, bytes scheduled, deferred bytes, messages sent, average AOI set size per client, and bytes per client. Summary reports include average and max runtime duration plus client-normalized AOI, LOD mix, bandwidth, and budget-pressure metrics.
 
 Lag-compensation hooks keep authoritative entity positions by server tick, reconstruct sub-tick positions between adjacent retained samples, and validate simple historical sphere hits:
 
@@ -94,6 +94,7 @@ source position/cell + target position/cell
 - AOI filtering before replication scheduling.
 - Byte budgets enforced per client.
 - Budget-deferred updates remain dirty and are surfaced in metrics.
+- Selected full, reduced, and minimal LOD update counts are surfaced in tick metrics.
 - Hysteresis-stabilized per-client network LOD byte estimates affect scheduling and emitted payloads.
 - Per-tick network LOD selector hooks can override distance classifications before entity quality caps and budget fallback are applied.
 - LOD selection can degrade within configured payload tiers before deferring an update.

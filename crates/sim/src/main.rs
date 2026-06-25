@@ -92,6 +92,9 @@ struct TickSample {
     step_micros: u128,
     aoi_candidates: usize,
     selected_updates: usize,
+    selected_full_lod_updates: usize,
+    selected_reduced_lod_updates: usize,
+    selected_minimal_lod_updates: usize,
     deferred_updates: usize,
     exit_updates: usize,
     bytes_scheduled: usize,
@@ -118,6 +121,27 @@ impl SimReport {
         self.samples
             .iter()
             .map(|sample| sample.selected_updates)
+            .sum()
+    }
+
+    fn total_full_lod_updates(&self) -> usize {
+        self.samples
+            .iter()
+            .map(|sample| sample.selected_full_lod_updates)
+            .sum()
+    }
+
+    fn total_reduced_lod_updates(&self) -> usize {
+        self.samples
+            .iter()
+            .map(|sample| sample.selected_reduced_lod_updates)
+            .sum()
+    }
+
+    fn total_minimal_lod_updates(&self) -> usize {
+        self.samples
+            .iter()
+            .map(|sample| sample.selected_minimal_lod_updates)
             .sum()
     }
 
@@ -160,6 +184,18 @@ impl SimReport {
 
     fn avg_selected_per_tick(&self) -> f64 {
         self.total_selected() as f64 / self.samples.len() as f64
+    }
+
+    fn avg_full_lod_updates_per_tick(&self) -> f64 {
+        self.total_full_lod_updates() as f64 / self.samples.len() as f64
+    }
+
+    fn avg_reduced_lod_updates_per_tick(&self) -> f64 {
+        self.total_reduced_lod_updates() as f64 / self.samples.len() as f64
+    }
+
+    fn avg_minimal_lod_updates_per_tick(&self) -> f64 {
+        self.total_minimal_lod_updates() as f64 / self.samples.len() as f64
     }
 
     fn avg_deferred_per_tick(&self) -> f64 {
@@ -261,6 +297,9 @@ fn main() -> ExitCode {
             step_micros,
             aoi_candidates: metrics.aoi_candidates,
             selected_updates: metrics.selected_updates,
+            selected_full_lod_updates: metrics.selected_full_lod_updates,
+            selected_reduced_lod_updates: metrics.selected_reduced_lod_updates,
+            selected_minimal_lod_updates: metrics.selected_minimal_lod_updates,
             deferred_updates: metrics.deferred_updates,
             exit_updates: metrics.exit_updates,
             bytes_scheduled: metrics.bytes_scheduled,
@@ -269,12 +308,15 @@ fn main() -> ExitCode {
         });
 
         println!(
-            "tick={} runtime_ms={:.3} step_ms={:.3} candidates={} selected={} deferred={} exits={} bytes={} deferred_bytes={} messages={} avg_aoi_per_client={:.2} bytes_per_client={:.2}",
+            "tick={} runtime_ms={:.3} step_ms={:.3} candidates={} selected={} lod_full={} lod_reduced={} lod_minimal={} deferred={} exits={} bytes={} deferred_bytes={} messages={} avg_aoi_per_client={:.2} bytes_per_client={:.2}",
             metrics.tick.raw(),
             micros_to_ms(runtime_micros),
             micros_to_ms(step_micros),
             metrics.aoi_candidates,
             metrics.selected_updates,
+            metrics.selected_full_lod_updates,
+            metrics.selected_reduced_lod_updates,
+            metrics.selected_minimal_lod_updates,
             metrics.deferred_updates,
             metrics.exit_updates,
             metrics.bytes_scheduled,
@@ -371,7 +413,7 @@ fn print_report(report: &SimReport) {
 
 fn print_text_report(report: &SimReport) {
     println!(
-        "summary elapsed_ms={:.3} avg_runtime_ms={:.3} max_runtime_ms={:.3} avg_step_ms={:.3} avg_candidates_per_tick={:.2} avg_aoi_per_client_tick={:.2} avg_selected_per_tick={:.2} avg_deferred_per_tick={:.2} avg_bytes_per_tick={:.2} avg_bytes_per_client_tick={:.2} avg_deferred_bytes_per_tick={:.2} avg_messages_per_tick={:.2} total_deferred={} total_exits={}",
+        "summary elapsed_ms={:.3} avg_runtime_ms={:.3} max_runtime_ms={:.3} avg_step_ms={:.3} avg_candidates_per_tick={:.2} avg_aoi_per_client_tick={:.2} avg_selected_per_tick={:.2} avg_lod_full_per_tick={:.2} avg_lod_reduced_per_tick={:.2} avg_lod_minimal_per_tick={:.2} avg_deferred_per_tick={:.2} avg_bytes_per_tick={:.2} avg_bytes_per_client_tick={:.2} avg_deferred_bytes_per_tick={:.2} avg_messages_per_tick={:.2} total_deferred={} total_exits={}",
         micros_to_ms(report.elapsed_micros),
         report.avg_runtime_ms(),
         report.max_runtime_ms(),
@@ -379,6 +421,9 @@ fn print_text_report(report: &SimReport) {
         report.avg_candidates_per_tick(),
         report.avg_candidates_per_client_tick(),
         report.avg_selected_per_tick(),
+        report.avg_full_lod_updates_per_tick(),
+        report.avg_reduced_lod_updates_per_tick(),
+        report.avg_minimal_lod_updates_per_tick(),
         report.avg_deferred_per_tick(),
         report.avg_bytes_per_tick(),
         report.avg_bytes_per_client_tick(),
@@ -391,7 +436,7 @@ fn print_text_report(report: &SimReport) {
 
 fn print_json_report(report: &SimReport) {
     println!(
-        "summary_json={{\"scenario\":\"{}\",\"clients\":{},\"entities\":{},\"ticks\":{},\"tick_rate_hz\":{},\"world_size\":{},\"interest_radius\":{},\"byte_budget\":{},\"elapsed_ms\":{:.3},\"avg_runtime_ms\":{:.3},\"max_runtime_ms\":{:.3},\"avg_step_ms\":{:.3},\"avg_candidates_per_tick\":{:.3},\"avg_aoi_per_client_tick\":{:.3},\"avg_selected_per_tick\":{:.3},\"avg_deferred_per_tick\":{:.3},\"avg_bytes_per_tick\":{:.3},\"avg_bytes_per_client_tick\":{:.3},\"avg_deferred_bytes_per_tick\":{:.3},\"avg_messages_per_tick\":{:.3},\"total_deferred\":{},\"total_exits\":{}}}",
+        "summary_json={{\"scenario\":\"{}\",\"clients\":{},\"entities\":{},\"ticks\":{},\"tick_rate_hz\":{},\"world_size\":{},\"interest_radius\":{},\"byte_budget\":{},\"elapsed_ms\":{:.3},\"avg_runtime_ms\":{:.3},\"max_runtime_ms\":{:.3},\"avg_step_ms\":{:.3},\"avg_candidates_per_tick\":{:.3},\"avg_aoi_per_client_tick\":{:.3},\"avg_selected_per_tick\":{:.3},\"avg_lod_full_per_tick\":{:.3},\"avg_lod_reduced_per_tick\":{:.3},\"avg_lod_minimal_per_tick\":{:.3},\"avg_deferred_per_tick\":{:.3},\"avg_bytes_per_tick\":{:.3},\"avg_bytes_per_client_tick\":{:.3},\"avg_deferred_bytes_per_tick\":{:.3},\"avg_messages_per_tick\":{:.3},\"total_deferred\":{},\"total_exits\":{}}}",
         report.args.scenario.as_str(),
         report.args.clients,
         report.args.entities,
@@ -407,6 +452,9 @@ fn print_json_report(report: &SimReport) {
         report.avg_candidates_per_tick(),
         report.avg_candidates_per_client_tick(),
         report.avg_selected_per_tick(),
+        report.avg_full_lod_updates_per_tick(),
+        report.avg_reduced_lod_updates_per_tick(),
+        report.avg_minimal_lod_updates_per_tick(),
         report.avg_deferred_per_tick(),
         report.avg_bytes_per_tick(),
         report.avg_bytes_per_client_tick(),
