@@ -10,6 +10,62 @@ use gridwake_protocol::{
 use gridwake_replication::{NetworkLod, NetworkLodBytes, ReplicationGraph, VisibilityChange};
 use gridwake_snapshot::{build_delta, AckTracker, DeltaOp, SnapshotFrame, SnapshotHistory};
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NetworkLodPolicy {
+    pub full_distance_ratio: f32,
+    pub reduced_distance_ratio: f32,
+}
+
+impl Default for NetworkLodPolicy {
+    fn default() -> Self {
+        Self {
+            full_distance_ratio: 0.35,
+            reduced_distance_ratio: 0.75,
+        }
+    }
+}
+
+impl NetworkLodPolicy {
+    pub fn lod_for_distance_squared(
+        self,
+        distance_squared: f32,
+        interest_radius: f32,
+    ) -> NetworkLod {
+        if !distance_squared.is_finite() || !interest_radius.is_finite() || interest_radius <= 0.0 {
+            return NetworkLod::Full;
+        }
+
+        let full_ratio = normalized_ratio(self.full_distance_ratio, 0.35);
+        let reduced_ratio = normalized_ratio(self.reduced_distance_ratio, 0.75).max(full_ratio);
+        let full_distance = interest_radius * full_ratio;
+        let reduced_distance = interest_radius * reduced_ratio;
+
+        if distance_squared <= full_distance * full_distance {
+            NetworkLod::Full
+        } else if distance_squared <= reduced_distance * reduced_distance {
+            NetworkLod::Reduced
+        } else {
+            NetworkLod::Minimal
+        }
+    }
+}
+
+fn normalized_ratio(value: f32, fallback: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        fallback
+    }
+}
+
+fn cap_network_lod(default_lod: NetworkLod, selected_lod: NetworkLod) -> NetworkLod {
+    match (default_lod, selected_lod) {
+        (NetworkLod::Minimal, _) | (_, NetworkLod::Minimal) => NetworkLod::Minimal,
+        (NetworkLod::Reduced, _) | (_, NetworkLod::Reduced) => NetworkLod::Reduced,
+        (NetworkLod::Full, NetworkLod::Full) => NetworkLod::Full,
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ServerConfig {
     pub tick_rate_hz: u16,
@@ -18,6 +74,7 @@ pub struct ServerConfig {
     pub per_client_byte_budget: usize,
     pub snapshot_history: usize,
     pub lag_history_ticks: usize,
+    pub network_lod: NetworkLodPolicy,
 }
 
 impl Default for ServerConfig {
@@ -29,6 +86,7 @@ impl Default for ServerConfig {
             per_client_byte_budget: 1_200,
             snapshot_history: 32,
             lag_history_ticks: 64,
+            network_lod: NetworkLodPolicy::default(),
         }
     }
 }
@@ -828,9 +886,12 @@ impl ServerRuntime {
             let visible = self.aoi.query_observer(client).unwrap_or_default();
             metrics.aoi_candidates += visible.len();
             let visibility = self.replication.set_visibility(client, visible);
-            let selection = self
-                .replication
-                .select_for_client(client, ByteBudget::new(self.config.per_client_byte_budget));
+            let network_lod = self.network_lod_for_client(client, &visibility.visible);
+            let selection = self.replication.select_for_client_with_lod(
+                client,
+                ByteBudget::new(self.config.per_client_byte_budget),
+                |entity, default_lod| network_lod.get(&entity).copied().unwrap_or(default_lod),
+            );
 
             metrics.selected_updates += selection.updates.len();
             metrics.exit_updates += visibility.exited.len();
@@ -930,6 +991,31 @@ impl ServerRuntime {
         frame
     }
 
+    fn network_lod_for_client(
+        &self,
+        client: ClientId,
+        visible_entities: &[EntityId],
+    ) -> HashMap<EntityId, NetworkLod> {
+        let Some(client) = self.clients.get(&client) else {
+            return HashMap::new();
+        };
+        let mut lod_by_entity = HashMap::with_capacity(visible_entities.len());
+
+        for entity_id in visible_entities {
+            let Some(entity) = self.entities.get(entity_id) else {
+                continue;
+            };
+            let distance_squared = client.position.distance_squared(entity.position);
+            let lod = self
+                .config
+                .network_lod
+                .lod_for_distance_squared(distance_squared, client.interest_radius);
+            lod_by_entity.insert(*entity_id, cap_network_lod(entity.lod, lod));
+        }
+
+        lod_by_entity
+    }
+
     fn record_lag_history(&mut self, tick: Tick) {
         for entity in self.entities.values() {
             let samples = self.lag_history.entry(entity.id).or_default();
@@ -952,6 +1038,38 @@ mod tests {
 
     fn payload(id: u64) -> Vec<u8> {
         id.to_le_bytes().to_vec()
+    }
+
+    fn snapshot_payload_for(
+        transport: &FakeTransport,
+        client: ClientId,
+        entity: EntityId,
+    ) -> Vec<u8> {
+        let (_, message) = transport
+            .sent
+            .iter()
+            .find(|(target, _)| *target == client)
+            .expect("expected snapshot for client");
+        let ServerMessage::SnapshotDelta(delta) = message else {
+            panic!("expected snapshot delta");
+        };
+        delta
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                DeltaOp::SpawnOrEnter {
+                    entity: candidate,
+                    payload,
+                }
+                | DeltaOp::Update {
+                    entity: candidate,
+                    payload,
+                } if *candidate == entity => Some(payload.clone()),
+                DeltaOp::SpawnOrEnter { .. }
+                | DeltaOp::Update { .. }
+                | DeltaOp::DespawnOrExit { .. } => None,
+            })
+            .expect("expected entity payload")
     }
 
     #[test]
@@ -1079,6 +1197,92 @@ mod tests {
                 entity,
                 payload: b"full".to_vec()
             }]
+        );
+    }
+
+    #[test]
+    fn tick_applies_distance_based_lod_per_client() {
+        let mut runtime = ServerRuntime::new(ServerConfig {
+            default_interest_radius: 100.0,
+            per_client_byte_budget: 64,
+            network_lod: NetworkLodPolicy {
+                full_distance_ratio: 0.25,
+                reduced_distance_ratio: 0.50,
+            },
+            ..ServerConfig::default()
+        });
+        let near_client = ClientId::new(1);
+        let mid_client = ClientId::new(2);
+        let far_client = ClientId::new(3);
+        let entity = EntityId::new(1);
+        let mut transport = FakeTransport::default();
+
+        runtime.connect_client(near_client, Vec3::ZERO, None);
+        runtime.connect_client(mid_client, Vec3::new(40.0, 0.0, 0.0), None);
+        runtime.connect_client(far_client, Vec3::new(90.0, 0.0, 0.0), None);
+        runtime.spawn_entity_with_lod_payloads(
+            entity,
+            Vec3::ZERO,
+            NetworkLodPayloads::new(b"full".to_vec(), b"reduced".to_vec(), b"min".to_vec()),
+            1.0,
+            NetworkLod::Full,
+        );
+
+        let metrics = runtime.advance_tick(&mut transport);
+
+        assert_eq!(metrics.selected_updates, 3);
+        assert_eq!(transport.sent.len(), 3);
+        assert_eq!(
+            snapshot_payload_for(&transport, near_client, entity),
+            b"full".to_vec()
+        );
+        assert_eq!(
+            snapshot_payload_for(&transport, mid_client, entity),
+            b"reduced".to_vec()
+        );
+        assert_eq!(
+            snapshot_payload_for(&transport, far_client, entity),
+            b"min".to_vec()
+        );
+    }
+
+    #[test]
+    fn client_lod_band_change_reselects_clean_entity() {
+        let mut runtime = ServerRuntime::new(ServerConfig {
+            default_interest_radius: 100.0,
+            per_client_byte_budget: 64,
+            network_lod: NetworkLodPolicy {
+                full_distance_ratio: 0.25,
+                reduced_distance_ratio: 0.50,
+            },
+            ..ServerConfig::default()
+        });
+        let client = ClientId::new(1);
+        let entity = EntityId::new(1);
+        let mut transport = FakeTransport::default();
+
+        runtime.connect_client(client, Vec3::new(90.0, 0.0, 0.0), None);
+        runtime.spawn_entity_with_lod_payloads(
+            entity,
+            Vec3::ZERO,
+            NetworkLodPayloads::new(b"full".to_vec(), b"reduced".to_vec(), b"min".to_vec()),
+            1.0,
+            NetworkLod::Full,
+        );
+        runtime.advance_tick(&mut transport);
+        assert_eq!(
+            snapshot_payload_for(&transport, client, entity),
+            b"min".to_vec()
+        );
+        transport.clear();
+
+        assert!(runtime.update_client_position(client, Vec3::ZERO));
+        let metrics = runtime.advance_tick(&mut transport);
+
+        assert_eq!(metrics.selected_updates, 1);
+        assert_eq!(
+            snapshot_payload_for(&transport, client, entity),
+            b"full".to_vec()
         );
     }
 
