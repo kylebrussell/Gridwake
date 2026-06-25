@@ -7,6 +7,7 @@ use gridwake_server::{FakeTransport, ServerConfig, ServerRuntime, TickScheduler,
 
 #[derive(Clone, Copy, Debug)]
 struct SimArgs {
+    profile: Option<BenchmarkProfile>,
     scenario: Scenario,
     report: ReportFormat,
     clients: u64,
@@ -21,6 +22,7 @@ struct SimArgs {
 impl Default for SimArgs {
     fn default() -> Self {
         Self {
+            profile: None,
             scenario: Scenario::Uniform,
             report: ReportFormat::Text,
             clients: 100,
@@ -31,6 +33,14 @@ impl Default for SimArgs {
             interest_radius: 96.0,
             byte_budget: 1_200,
         }
+    }
+}
+
+impl SimArgs {
+    fn profile_name(self) -> &'static str {
+        self.profile
+            .map(BenchmarkProfile::as_str)
+            .unwrap_or("custom")
     }
 }
 
@@ -82,6 +92,107 @@ impl Scenario {
             Self::DenseHotspot => "dense-hotspot",
             Self::MovingBattlefront => "moving-battlefront",
             Self::SparseOpenWorld => "sparse-open-world",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BenchmarkProfile {
+    Quick,
+    Baseline,
+    Hotspot,
+    Scale,
+}
+
+impl BenchmarkProfile {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "quick" => Some(Self::Quick),
+            "baseline" => Some(Self::Baseline),
+            "hotspot" => Some(Self::Hotspot),
+            "scale" => Some(Self::Scale),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Quick => "quick",
+            Self::Baseline => "baseline",
+            Self::Hotspot => "hotspot",
+            Self::Scale => "scale",
+        }
+    }
+
+    fn args(self) -> SimArgs {
+        let mut args = SimArgs {
+            profile: Some(self),
+            ..SimArgs::default()
+        };
+        match self {
+            Self::Quick => {}
+            Self::Baseline => {
+                args.clients = 250;
+                args.entities = 2_500;
+                args.ticks = 30;
+            }
+            Self::Hotspot => {
+                args.scenario = Scenario::DenseHotspot;
+                args.clients = 250;
+                args.entities = 2_500;
+                args.ticks = 30;
+            }
+            Self::Scale => {
+                args.clients = 1_000;
+                args.entities = 10_000;
+                args.ticks = 10;
+            }
+        }
+        args
+    }
+}
+
+#[derive(Default)]
+struct SimArgOverrides {
+    scenario: Option<Scenario>,
+    report: Option<ReportFormat>,
+    clients: Option<u64>,
+    entities: Option<u64>,
+    ticks: Option<u64>,
+    tick_rate_hz: Option<u16>,
+    world_size: Option<f32>,
+    interest_radius: Option<f32>,
+    byte_budget: Option<usize>,
+}
+
+impl SimArgOverrides {
+    fn apply_to(self, args: &mut SimArgs) {
+        if let Some(scenario) = self.scenario {
+            args.scenario = scenario;
+        }
+        if let Some(report) = self.report {
+            args.report = report;
+        }
+        if let Some(clients) = self.clients {
+            args.clients = clients;
+        }
+        if let Some(entities) = self.entities {
+            args.entities = entities;
+        }
+        if let Some(ticks) = self.ticks {
+            args.ticks = ticks;
+        }
+        if let Some(tick_rate_hz) = self.tick_rate_hz {
+            args.tick_rate_hz = tick_rate_hz;
+        }
+        if let Some(world_size) = self.world_size {
+            args.world_size = world_size;
+        }
+        if let Some(interest_radius) = self.interest_radius {
+            args.interest_radius = interest_radius;
+        }
+        if let Some(byte_budget) = self.byte_budget {
+            args.byte_budget = byte_budget;
         }
     }
 }
@@ -264,7 +375,8 @@ fn main() -> ExitCode {
     let mut samples = Vec::with_capacity(args.ticks as usize);
 
     println!(
-        "gridwake-sim scenario={} clients={} entities={} ticks={} tick_rate_hz={} radius={} budget={} report={}",
+        "gridwake-sim profile={} scenario={} clients={} entities={} ticks={} tick_rate_hz={} radius={} budget={} report={}",
+        args.profile_name(),
         args.scenario.as_str(),
         args.clients,
         args.entities,
@@ -339,7 +451,8 @@ fn main() -> ExitCode {
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<SimArgs, String> {
-    let mut parsed = SimArgs::default();
+    let mut profile = None;
+    let mut overrides = SimArgOverrides::default();
     let mut args = args.peekable();
 
     while let Some(arg) = args.next() {
@@ -353,24 +466,36 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<SimArgs, String> {
         };
 
         match arg.as_str() {
-            "--clients" => parsed.clients = parse_positive(&arg, &value)?,
-            "--entities" => parsed.entities = parse_positive(&arg, &value)?,
-            "--ticks" => parsed.ticks = parse_positive(&arg, &value)?,
-            "--tick-rate" => parsed.tick_rate_hz = parse_positive(&arg, &value)?,
+            "--profile" => {
+                profile = Some(
+                    BenchmarkProfile::parse(&value)
+                        .ok_or_else(|| format!("unknown benchmark profile {value}"))?,
+                );
+            }
+            "--clients" => overrides.clients = Some(parse_positive(&arg, &value)?),
+            "--entities" => overrides.entities = Some(parse_positive(&arg, &value)?),
+            "--ticks" => overrides.ticks = Some(parse_positive(&arg, &value)?),
+            "--tick-rate" => overrides.tick_rate_hz = Some(parse_positive(&arg, &value)?),
             "--report" => {
-                parsed.report = ReportFormat::parse(&value)
-                    .ok_or_else(|| format!("unknown report format {value}"))?;
+                overrides.report = Some(
+                    ReportFormat::parse(&value)
+                        .ok_or_else(|| format!("unknown report format {value}"))?,
+                );
             }
             "--scenario" => {
-                parsed.scenario =
-                    Scenario::parse(&value).ok_or_else(|| format!("unknown scenario {value}"))?;
+                overrides.scenario = Some(
+                    Scenario::parse(&value).ok_or_else(|| format!("unknown scenario {value}"))?,
+                );
             }
-            "--world-size" => parsed.world_size = parse_f32(&arg, &value)?,
-            "--radius" => parsed.interest_radius = parse_f32(&arg, &value)?,
-            "--budget" => parsed.byte_budget = parse_positive(&arg, &value)?,
+            "--world-size" => overrides.world_size = Some(parse_f32(&arg, &value)?),
+            "--radius" => overrides.interest_radius = Some(parse_f32(&arg, &value)?),
+            "--budget" => overrides.byte_budget = Some(parse_positive(&arg, &value)?),
             _ => return Err(format!("unknown argument {arg}")),
         }
     }
+
+    let mut parsed = profile.map(BenchmarkProfile::args).unwrap_or_default();
+    overrides.apply_to(&mut parsed);
 
     Ok(parsed)
 }
@@ -400,7 +525,7 @@ fn parse_f32(name: &str, value: &str) -> Result<f32, String> {
 
 fn print_usage() {
     eprintln!(
-        "usage: cargo run -p gridwake-sim -- [--scenario uniform|dense-hotspot|moving-battlefront|sparse-open-world] [--clients N] [--entities N] [--ticks N] [--tick-rate HZ] [--world-size N] [--radius N] [--budget N] [--report text|json]"
+        "usage: cargo run -p gridwake-sim -- [--profile quick|baseline|hotspot|scale] [--scenario uniform|dense-hotspot|moving-battlefront|sparse-open-world] [--clients N] [--entities N] [--ticks N] [--tick-rate HZ] [--world-size N] [--radius N] [--budget N] [--report text|json]"
     );
 }
 
@@ -436,7 +561,8 @@ fn print_text_report(report: &SimReport) {
 
 fn print_json_report(report: &SimReport) {
     println!(
-        "summary_json={{\"scenario\":\"{}\",\"clients\":{},\"entities\":{},\"ticks\":{},\"tick_rate_hz\":{},\"world_size\":{},\"interest_radius\":{},\"byte_budget\":{},\"elapsed_ms\":{:.3},\"avg_runtime_ms\":{:.3},\"max_runtime_ms\":{:.3},\"avg_step_ms\":{:.3},\"avg_candidates_per_tick\":{:.3},\"avg_aoi_per_client_tick\":{:.3},\"avg_selected_per_tick\":{:.3},\"avg_lod_full_per_tick\":{:.3},\"avg_lod_reduced_per_tick\":{:.3},\"avg_lod_minimal_per_tick\":{:.3},\"avg_deferred_per_tick\":{:.3},\"avg_bytes_per_tick\":{:.3},\"avg_bytes_per_client_tick\":{:.3},\"avg_deferred_bytes_per_tick\":{:.3},\"avg_messages_per_tick\":{:.3},\"total_deferred\":{},\"total_exits\":{}}}",
+        "summary_json={{\"profile\":\"{}\",\"scenario\":\"{}\",\"clients\":{},\"entities\":{},\"ticks\":{},\"tick_rate_hz\":{},\"world_size\":{},\"interest_radius\":{},\"byte_budget\":{},\"elapsed_ms\":{:.3},\"avg_runtime_ms\":{:.3},\"max_runtime_ms\":{:.3},\"avg_step_ms\":{:.3},\"avg_candidates_per_tick\":{:.3},\"avg_aoi_per_client_tick\":{:.3},\"avg_selected_per_tick\":{:.3},\"avg_lod_full_per_tick\":{:.3},\"avg_lod_reduced_per_tick\":{:.3},\"avg_lod_minimal_per_tick\":{:.3},\"avg_deferred_per_tick\":{:.3},\"avg_bytes_per_tick\":{:.3},\"avg_bytes_per_client_tick\":{:.3},\"avg_deferred_bytes_per_tick\":{:.3},\"avg_messages_per_tick\":{:.3},\"total_deferred\":{},\"total_exits\":{}}}",
+        report.args.profile_name(),
         report.args.scenario.as_str(),
         report.args.clients,
         report.args.entities,
@@ -597,4 +723,59 @@ fn payload_for(id: u64, x: f32, y: f32) -> Vec<u8> {
     payload.extend_from_slice(&x.to_le_bytes());
     payload.extend_from_slice(&y.to_le_bytes());
     payload
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_test_args(args: &[&str]) -> Result<SimArgs, String> {
+        parse_args(args.iter().map(|arg| (*arg).to_owned()))
+    }
+
+    #[test]
+    fn scale_profile_applies_repeatable_defaults() {
+        let args = parse_test_args(&["--profile", "scale"]).unwrap();
+
+        assert_eq!(args.profile, Some(BenchmarkProfile::Scale));
+        assert_eq!(args.profile_name(), "scale");
+        assert_eq!(args.scenario, Scenario::Uniform);
+        assert_eq!(args.clients, 1_000);
+        assert_eq!(args.entities, 10_000);
+        assert_eq!(args.ticks, 10);
+        assert_eq!(args.tick_rate_hz, 20);
+        assert_eq!(args.interest_radius, 96.0);
+        assert_eq!(args.byte_budget, 1_200);
+    }
+
+    #[test]
+    fn explicit_args_override_profile_defaults_independent_of_order() {
+        let args = parse_test_args(&[
+            "--clients",
+            "25",
+            "--profile",
+            "hotspot",
+            "--ticks",
+            "2",
+            "--scenario",
+            "sparse-open-world",
+            "--report",
+            "json",
+        ])
+        .unwrap();
+
+        assert_eq!(args.profile, Some(BenchmarkProfile::Hotspot));
+        assert_eq!(args.scenario, Scenario::SparseOpenWorld);
+        assert_eq!(args.report, ReportFormat::Json);
+        assert_eq!(args.clients, 25);
+        assert_eq!(args.entities, 2_500);
+        assert_eq!(args.ticks, 2);
+    }
+
+    #[test]
+    fn unknown_profile_is_rejected() {
+        let error = parse_test_args(&["--profile", "unknown"]).unwrap_err();
+
+        assert_eq!(error, "unknown benchmark profile unknown");
+    }
 }

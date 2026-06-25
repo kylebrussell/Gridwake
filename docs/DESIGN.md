@@ -12,7 +12,7 @@ The workspace uses crate-level boundaries so each subsystem can be tested indepe
 - `gridwake-snapshot` represents snapshot frames and delta operations without choosing a serializer or transport.
 - `gridwake-protocol` contains transport-neutral messages and a small versioned byte codec.
 - `gridwake-server` composes the crates into an authoritative fixed-step tick shell, adapts memory or UDP byte transports through the protocol codec, pumps inbound client messages, records metrics through sinks, applies customizable budget-aware hysteresis-stabilized per-client network LODs to snapshot payloads, reports per-LOD and budget-deferred update pressure, retains bounded entity-position history with exact and interpolated lag-compensation lookup plus rewound sphere-hit validation, and tracks cell ownership for local versus cross-region event routing into dispatchable region batches.
-- `gridwake-sim` drives fake clients and entities through deterministic synthetic scenarios using the same fixed-step scheduler and emits text or JSON summaries for repeatable load-test comparisons.
+- `gridwake-sim` drives fake clients and entities through deterministic synthetic scenarios and named benchmark profiles using the same fixed-step scheduler, then emits text or JSON summaries for repeatable load-test comparisons.
 
 ## Data Flow
 
@@ -60,7 +60,7 @@ elapsed time
   -> record tick metrics
 ```
 
-Simulation reports include per-tick runtime and step timing, AOI candidates, selected updates, selected full/reduced/minimal LOD counts, budget-deferred updates, exits, bytes scheduled, deferred bytes, messages sent, average AOI set size per client, and bytes per client. Summary reports include average and max runtime duration plus client-normalized AOI, LOD mix, bandwidth, and budget-pressure metrics.
+Simulation reports include per-tick runtime and step timing, AOI candidates, selected updates, selected full/reduced/minimal LOD counts, budget-deferred updates, exits, bytes scheduled, deferred bytes, messages sent, average AOI set size per client, and bytes per client. Named quick, baseline, hotspot, and scale profiles provide repeatable load-test entry points. Summary reports include average and max runtime duration plus client-normalized AOI, LOD mix, bandwidth, and budget-pressure metrics.
 
 Lag-compensation hooks keep authoritative entity positions by server tick, reconstruct sub-tick positions between adjacent retained samples, and validate simple historical sphere hits:
 
@@ -113,4 +113,4 @@ source position/cell + target position/cell
 - Per-client network LOD is distance-band based with hysteresis, selector hooks, and budget-aware fallback; longer-term load feedback is not implemented yet.
 - Lag-compensation support has exact/interpolated position lookup and sphere-hit validation; full rewind physics and engine collision integration are not implemented yet.
 - A UDP byte adapter exists; production transport integrations, reliability, auth, and session lifecycle are not implemented yet.
-- The simulation harness has deterministic named scenarios, fixed-step ticking, and text/JSON summaries, but still needs sustained benchmark profiles and external visualization.
+- The simulation harness has deterministic named scenarios, benchmark profiles, fixed-step ticking, and text/JSON summaries, but still needs external visualization.

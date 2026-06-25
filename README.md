@@ -14,7 +14,7 @@ The project is intentionally not a renderer, editor, physics engine, matchmaking
 | `gridwake-snapshot` | Snapshot frames, delta ops, retained baseline history, and ack tracking. |
 | `gridwake-protocol` | Transport-neutral client/server message enums, metric frames, and a versioned byte codec. |
 | `gridwake-server` | Authoritative runtime shell using fake/memory/UDP codec transports, inbound message pumping, fixed-step scheduling, metrics sinks, AOI, customizable budget-aware hysteresis-stabilized per-client LOD payloads, acked snapshot deltas, per-LOD and budget-deferred update metrics, bounded interpolated lag-history and sphere-hit validation hooks, cell ownership, and dispatchable cross-cell event batches. |
-| `gridwake-sim` | Runnable load-test harness with fake clients, fake entities, fixed-step ticks, and named synthetic scenarios. |
+| `gridwake-sim` | Runnable load-test harness with fake clients, fake entities, fixed-step ticks, named synthetic scenarios, and repeatable benchmark profiles. |
 
 ## Adjacent Projects
 
@@ -35,6 +35,10 @@ Gridwake's non-duplicative direction is an engine-neutral replication and simula
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo run -p gridwake-sim -- --profile quick
+cargo run -p gridwake-sim -- --profile baseline --report json
+cargo run -p gridwake-sim -- --profile hotspot
+cargo run -p gridwake-sim -- --profile scale --ticks 1 --report json
 cargo run -p gridwake-sim -- --scenario uniform --clients 100 --entities 1000 --ticks 10 --tick-rate 20
 cargo run -p gridwake-sim -- --scenario dense-hotspot --clients 100 --entities 1000 --ticks 10
 cargo run -p gridwake-sim -- --scenario moving-battlefront --clients 100 --entities 1000 --ticks 10
