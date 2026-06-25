@@ -244,6 +244,33 @@ pub struct LagSample {
     pub position: Vec3,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LagRay {
+    pub origin: Vec3,
+    pub direction: Vec3,
+    pub max_distance: f32,
+}
+
+impl LagRay {
+    pub const fn new(origin: Vec3, direction: Vec3, max_distance: f32) -> Self {
+        Self {
+            origin,
+            direction,
+            max_distance,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LagSphereHit {
+    pub entity: EntityId,
+    pub tick: Tick,
+    pub sub_tick: f32,
+    pub center: Vec3,
+    pub radius: f32,
+    pub distance_along_ray: f32,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TickMetrics {
     pub tick: Tick,
@@ -846,6 +873,29 @@ impl ServerRuntime {
         Some(start.position.lerp(end.position, sub_tick))
     }
 
+    pub fn validate_rewound_sphere_hit(
+        &self,
+        entity: EntityId,
+        tick: Tick,
+        sub_tick: f32,
+        ray: LagRay,
+        radius: f32,
+    ) -> Option<LagSphereHit> {
+        let sub_tick = normalized_sub_tick(sub_tick);
+        let center = self.rewind_entity_position_interpolated(entity, tick, sub_tick)?;
+        let distance_along_ray =
+            ray_sphere_hit_distance(ray.origin, ray.direction, ray.max_distance, center, radius)?;
+
+        Some(LagSphereHit {
+            entity,
+            tick,
+            sub_tick,
+            center,
+            radius,
+            distance_along_ray,
+        })
+    }
+
     pub fn latest_entity_position_sample(&self, entity: EntityId) -> Option<LagSample> {
         self.lag_history.get(&entity)?.back().copied()
     }
@@ -1184,6 +1234,64 @@ fn normalized_sub_tick(sub_tick: f32) -> f32 {
     } else {
         0.0
     }
+}
+
+fn ray_sphere_hit_distance(
+    origin: Vec3,
+    direction: Vec3,
+    max_distance: f32,
+    center: Vec3,
+    radius: f32,
+) -> Option<f32> {
+    if !origin.is_finite()
+        || !direction.is_finite()
+        || !center.is_finite()
+        || !max_distance.is_finite()
+        || !radius.is_finite()
+        || max_distance < 0.0
+        || radius < 0.0
+    {
+        return None;
+    }
+
+    let direction_len_sq = direction.distance_squared(Vec3::ZERO);
+    if direction_len_sq <= f32::EPSILON {
+        return None;
+    }
+
+    let direction_len = direction_len_sq.sqrt();
+    let unit_direction = Vec3::new(
+        direction.x / direction_len,
+        direction.y / direction_len,
+        direction.z / direction_len,
+    );
+    let to_center = Vec3::new(
+        center.x - origin.x,
+        center.y - origin.y,
+        center.z - origin.z,
+    );
+    let projection = dot(to_center, unit_direction);
+    let center_distance_sq = to_center.distance_squared(Vec3::ZERO);
+    let perpendicular_distance_sq = (center_distance_sq - projection * projection).max(0.0);
+    let radius_sq = radius * radius;
+
+    if perpendicular_distance_sq > radius_sq {
+        return None;
+    }
+
+    let half_chord = (radius_sq - perpendicular_distance_sq).sqrt();
+    let near_distance = projection - half_chord;
+    let far_distance = projection + half_chord;
+    if far_distance < 0.0 || near_distance > max_distance {
+        return None;
+    }
+
+    Some(near_distance.max(0.0))
+}
+
+fn dot(left: Vec3, right: Vec3) -> f32 {
+    left.x
+        .mul_add(right.x, left.y.mul_add(right.y, left.z * right.z))
 }
 
 #[cfg(test)]
@@ -1922,6 +2030,125 @@ mod tests {
         );
         assert_eq!(
             runtime.rewind_entity_position_interpolated(entity, Tick::new(2), 0.5),
+            None
+        );
+    }
+
+    #[test]
+    fn lag_history_validates_rewound_sphere_hits() {
+        let mut runtime = ServerRuntime::new(ServerConfig {
+            default_interest_radius: 10.0,
+            per_client_byte_budget: 100,
+            ..ServerConfig::default()
+        });
+        let entity = EntityId::new(1);
+        let mut transport = FakeTransport::default();
+
+        runtime.spawn_entity(
+            entity,
+            Vec3::new(0.0, 0.0, 0.0),
+            payload(entity.raw()),
+            16,
+            1.0,
+        );
+        runtime.advance_tick(&mut transport);
+        runtime.move_entity(entity, Vec3::new(10.0, 0.0, 0.0));
+        runtime.advance_tick(&mut transport);
+
+        assert_eq!(
+            runtime.validate_rewound_sphere_hit(
+                entity,
+                Tick::new(1),
+                0.5,
+                LagRay::new(Vec3::ZERO, Vec3::new(1.0, 0.0, 0.0), 10.0),
+                0.5,
+            ),
+            Some(LagSphereHit {
+                entity,
+                tick: Tick::new(1),
+                sub_tick: 0.5,
+                center: Vec3::new(5.0, 0.0, 0.0),
+                radius: 0.5,
+                distance_along_ray: 4.5,
+            })
+        );
+
+        assert_eq!(
+            runtime.validate_rewound_sphere_hit(
+                entity,
+                Tick::new(1),
+                2.0,
+                LagRay::new(Vec3::ZERO, Vec3::new(1.0, 0.0, 0.0), 10.0),
+                0.5,
+            ),
+            Some(LagSphereHit {
+                entity,
+                tick: Tick::new(1),
+                sub_tick: 1.0,
+                center: Vec3::new(10.0, 0.0, 0.0),
+                radius: 0.5,
+                distance_along_ray: 9.5,
+            })
+        );
+    }
+
+    #[test]
+    fn lag_history_rejects_rewound_sphere_misses_and_invalid_queries() {
+        let mut runtime = ServerRuntime::new(ServerConfig {
+            default_interest_radius: 10.0,
+            per_client_byte_budget: 100,
+            ..ServerConfig::default()
+        });
+        let entity = EntityId::new(1);
+        let mut transport = FakeTransport::default();
+
+        runtime.spawn_entity(
+            entity,
+            Vec3::new(5.0, 2.0, 0.0),
+            payload(entity.raw()),
+            16,
+            1.0,
+        );
+        runtime.advance_tick(&mut transport);
+
+        assert_eq!(
+            runtime.validate_rewound_sphere_hit(
+                entity,
+                Tick::new(1),
+                0.0,
+                LagRay::new(Vec3::ZERO, Vec3::new(1.0, 0.0, 0.0), 10.0),
+                0.5,
+            ),
+            None
+        );
+        assert_eq!(
+            runtime.validate_rewound_sphere_hit(
+                entity,
+                Tick::new(1),
+                0.0,
+                LagRay::new(Vec3::ZERO, Vec3::new(1.0, 0.0, 0.0), 2.0),
+                3.0,
+            ),
+            None
+        );
+        assert_eq!(
+            runtime.validate_rewound_sphere_hit(
+                entity,
+                Tick::new(1),
+                0.0,
+                LagRay::new(Vec3::ZERO, Vec3::ZERO, 10.0),
+                1.0,
+            ),
+            None
+        );
+        assert_eq!(
+            runtime.validate_rewound_sphere_hit(
+                entity,
+                Tick::new(1),
+                0.0,
+                LagRay::new(Vec3::ZERO, Vec3::new(1.0, 0.0, 0.0), 10.0),
+                -1.0,
+            ),
             None
         );
     }

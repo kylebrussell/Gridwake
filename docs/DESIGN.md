@@ -11,7 +11,7 @@ The workspace uses crate-level boundaries so each subsystem can be tested indepe
 - `gridwake-replication` tracks client visibility, entity dirty generations, priority accumulation, per-client network LOD byte estimates, and byte-budgeted update selection.
 - `gridwake-snapshot` represents snapshot frames and delta operations without choosing a serializer or transport.
 - `gridwake-protocol` contains transport-neutral messages and a small versioned byte codec.
-- `gridwake-server` composes the crates into an authoritative fixed-step tick shell, adapts memory or UDP byte transports through the protocol codec, pumps inbound client messages, records metrics through sinks, applies distance-based per-client network LODs to snapshot payloads, reports budget-deferred update pressure, retains bounded entity-position history with exact and interpolated lag-compensation lookup, and tracks cell ownership for local versus cross-region event routing into dispatchable region batches.
+- `gridwake-server` composes the crates into an authoritative fixed-step tick shell, adapts memory or UDP byte transports through the protocol codec, pumps inbound client messages, records metrics through sinks, applies distance-based per-client network LODs to snapshot payloads, reports budget-deferred update pressure, retains bounded entity-position history with exact and interpolated lag-compensation lookup plus rewound sphere-hit validation, and tracks cell ownership for local versus cross-region event routing into dispatchable region batches.
 - `gridwake-sim` drives fake clients and entities through deterministic synthetic scenarios using the same fixed-step scheduler and emits text or JSON summaries for repeatable load-test comparisons.
 
 ## Data Flow
@@ -62,14 +62,15 @@ elapsed time
 
 Simulation reports include per-tick runtime and step timing, AOI candidates, selected updates, budget-deferred updates, exits, bytes scheduled, deferred bytes, messages sent, average AOI set size per client, and bytes per client. Summary reports include average and max runtime duration plus client-normalized AOI, bandwidth, and budget-pressure metrics.
 
-Lag-compensation hooks keep authoritative entity positions by server tick and can reconstruct sub-tick positions between adjacent retained samples:
+Lag-compensation hooks keep authoritative entity positions by server tick, reconstruct sub-tick positions between adjacent retained samples, and validate simple historical sphere hits:
 
 ```text
 server entity positions
   -> bounded per-entity tick history
   -> exact rewind lookup by tick
   -> interpolated sub-tick lookup between adjacent samples
-  -> future hit validation or rewind-physics policy
+  -> ray versus rewound sphere validation
+  -> future rewind-physics policy
 ```
 
 Cross-cell events are classified separately from state replication:
@@ -98,7 +99,7 @@ source position/cell + target position/cell
 - Fixed-step scheduling with catch-up caps.
 - Inbound client messages are transport-neutral and pumped before due ticks.
 - Cross-cell events drain through explicit region handoff batches.
-- Lag-compensation history stores authoritative server positions by tick and supports interpolation.
+- Lag-compensation history stores authoritative server positions by tick and supports interpolation plus sphere-hit validation.
 - Deterministic tests where possible.
 - Metrics emitted from the first runnable path, with JSON summaries for scripted load-test comparisons.
 
@@ -107,6 +108,6 @@ source position/cell + target position/cell
 - Cell/region ownership has dispatchable region batches; durable or networked multi-process delivery is not implemented yet.
 - Snapshot baselines are retained per client and used for runtime deltas; payload-level compression is not implemented yet.
 - Per-client network LOD is distance-band based; hysteresis, load feedback, and custom policy hooks are not implemented yet.
-- Lag-compensation support has exact and interpolated position lookup; hit shapes and rewind physics are not implemented yet.
+- Lag-compensation support has exact/interpolated position lookup and sphere-hit validation; full rewind physics and engine collision integration are not implemented yet.
 - A UDP byte adapter exists; production transport integrations, reliability, auth, and session lifecycle are not implemented yet.
 - The simulation harness has deterministic named scenarios, fixed-step ticking, and text/JSON summaries, but still needs sustained benchmark profiles and external visualization.

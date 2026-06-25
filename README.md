@@ -13,7 +13,7 @@ The project is intentionally not a renderer, editor, physics engine, matchmaking
 | `gridwake-replication` | Per-client visibility, dirty generations, priority accumulation, per-client network LOD byte estimates, and byte-budgeted selection. |
 | `gridwake-snapshot` | Snapshot frames, delta ops, retained baseline history, and ack tracking. |
 | `gridwake-protocol` | Transport-neutral client/server message enums, metric frames, and a versioned byte codec. |
-| `gridwake-server` | Authoritative runtime shell using fake/memory/UDP codec transports, inbound message pumping, fixed-step scheduling, metrics sinks, AOI, distance-based per-client LOD payloads, acked snapshot deltas, budget-deferred update metrics, bounded interpolated lag-history hooks, cell ownership, and dispatchable cross-cell event batches. |
+| `gridwake-server` | Authoritative runtime shell using fake/memory/UDP codec transports, inbound message pumping, fixed-step scheduling, metrics sinks, AOI, distance-based per-client LOD payloads, acked snapshot deltas, budget-deferred update metrics, bounded interpolated lag-history and sphere-hit validation hooks, cell ownership, and dispatchable cross-cell event batches. |
 | `gridwake-sim` | Runnable load-test harness with fake clients, fake entities, fixed-step ticks, and named synthetic scenarios. |
 
 ## Adjacent Projects
