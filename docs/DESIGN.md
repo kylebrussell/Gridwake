@@ -12,7 +12,7 @@ The workspace uses crate-level boundaries so each subsystem can be tested indepe
 - `gridwake-snapshot` represents snapshot frames and delta operations without choosing a serializer or transport.
 - `gridwake-protocol` contains transport-neutral messages and a small versioned byte codec.
 - `gridwake-server` composes the crates into an authoritative fixed-step tick shell, adapts byte transports through the protocol codec, pumps inbound client messages, records metrics through sinks, retains bounded entity-position history for lag-compensation hooks, and tracks cell ownership for local versus cross-region event routing into region outboxes.
-- `gridwake-sim` drives fake clients and entities through deterministic synthetic scenarios using the same fixed-step scheduler.
+- `gridwake-sim` drives fake clients and entities through deterministic synthetic scenarios using the same fixed-step scheduler and emits text or JSON summaries for repeatable load-test comparisons.
 
 ## Data Flow
 
@@ -56,6 +56,8 @@ elapsed time
   -> record tick metrics
 ```
 
+Simulation reports include per-tick runtime and step timing, AOI candidates, selected updates, exits, bytes scheduled, messages sent, average AOI set size per client, and bytes per client. Summary reports include average and max runtime duration plus client-normalized AOI and bandwidth metrics.
+
 Lag-compensation hooks are intentionally minimal at this stage:
 
 ```text
@@ -88,7 +90,7 @@ source position/cell + target position/cell
 - Inbound client messages are transport-neutral and pumped before due ticks.
 - Lag-compensation history stores authoritative server positions by tick.
 - Deterministic tests where possible.
-- Metrics emitted from the first runnable path.
+- Metrics emitted from the first runnable path, with JSON summaries for scripted load-test comparisons.
 
 ## Near-Term Gaps
 
@@ -96,4 +98,4 @@ source position/cell + target position/cell
 - Snapshot baselines are retained per client and used for runtime deltas; payload-level compression is not implemented yet.
 - Lag-compensation support is exact-position history only; interpolation, hit shapes, and rewind physics are not implemented yet.
 - Real socket transport adapters are not implemented yet; the codec-backed byte adapter is the integration point.
-- The simulation harness has deterministic named scenarios and fixed-step ticking, but still needs sustained benchmark reporting and larger default profiles.
+- The simulation harness has deterministic named scenarios, fixed-step ticking, and text/JSON summaries, but still needs sustained benchmark profiles and external visualization.

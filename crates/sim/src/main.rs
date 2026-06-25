@@ -8,6 +8,7 @@ use gridwake_server::{FakeTransport, ServerConfig, ServerRuntime, TickScheduler,
 #[derive(Clone, Copy, Debug)]
 struct SimArgs {
     scenario: Scenario,
+    report: ReportFormat,
     clients: u64,
     entities: u64,
     ticks: u64,
@@ -21,6 +22,7 @@ impl Default for SimArgs {
     fn default() -> Self {
         Self {
             scenario: Scenario::Uniform,
+            report: ReportFormat::Text,
             clients: 100,
             entities: 1_000,
             ticks: 10,
@@ -28,6 +30,29 @@ impl Default for SimArgs {
             world_size: 1_000.0,
             interest_radius: 96.0,
             byte_budget: 1_200,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReportFormat {
+    Text,
+    Json,
+}
+
+impl ReportFormat {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "text" => Some(Self::Text),
+            "json" => Some(Self::Json),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Json => "json",
         }
     }
 }
@@ -61,6 +86,97 @@ impl Scenario {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct TickSample {
+    runtime_micros: u128,
+    step_micros: u128,
+    aoi_candidates: usize,
+    selected_updates: usize,
+    exit_updates: usize,
+    bytes_scheduled: usize,
+    messages_sent: usize,
+}
+
+#[derive(Debug)]
+struct SimReport {
+    args: SimArgs,
+    samples: Vec<TickSample>,
+    elapsed_micros: u128,
+}
+
+impl SimReport {
+    fn total_candidates(&self) -> usize {
+        self.samples
+            .iter()
+            .map(|sample| sample.aoi_candidates)
+            .sum()
+    }
+
+    fn total_selected(&self) -> usize {
+        self.samples
+            .iter()
+            .map(|sample| sample.selected_updates)
+            .sum()
+    }
+
+    fn total_exits(&self) -> usize {
+        self.samples.iter().map(|sample| sample.exit_updates).sum()
+    }
+
+    fn total_bytes(&self) -> usize {
+        self.samples
+            .iter()
+            .map(|sample| sample.bytes_scheduled)
+            .sum()
+    }
+
+    fn total_messages(&self) -> usize {
+        self.samples.iter().map(|sample| sample.messages_sent).sum()
+    }
+
+    fn avg_candidates_per_tick(&self) -> f64 {
+        self.total_candidates() as f64 / self.samples.len() as f64
+    }
+
+    fn avg_candidates_per_client_tick(&self) -> f64 {
+        self.avg_candidates_per_tick() / self.args.clients as f64
+    }
+
+    fn avg_selected_per_tick(&self) -> f64 {
+        self.total_selected() as f64 / self.samples.len() as f64
+    }
+
+    fn avg_bytes_per_tick(&self) -> f64 {
+        self.total_bytes() as f64 / self.samples.len() as f64
+    }
+
+    fn avg_bytes_per_client_tick(&self) -> f64 {
+        self.avg_bytes_per_tick() / self.args.clients as f64
+    }
+
+    fn avg_messages_per_tick(&self) -> f64 {
+        self.total_messages() as f64 / self.samples.len() as f64
+    }
+
+    fn avg_runtime_ms(&self) -> f64 {
+        avg_micros(self.samples.iter().map(|sample| sample.runtime_micros))
+    }
+
+    fn max_runtime_ms(&self) -> f64 {
+        micros_to_ms(
+            self.samples
+                .iter()
+                .map(|sample| sample.runtime_micros)
+                .max()
+                .unwrap_or(0),
+        )
+    }
+
+    fn avg_step_ms(&self) -> f64 {
+        avg_micros(self.samples.iter().map(|sample| sample.step_micros))
+    }
+}
+
 fn main() -> ExitCode {
     let args = match parse_args(env::args().skip(1)) {
         Ok(args) => args,
@@ -85,57 +201,69 @@ fn main() -> ExitCode {
     let mut scheduler = TickScheduler::from_hz(args.tick_rate_hz, 8);
     let tick_interval = scheduler.tick_interval();
     let mut metrics_sink = VecMetrics::default();
-    let mut total_selected = 0usize;
-    let mut total_bytes = 0usize;
-    let mut total_candidates = 0usize;
+    let mut samples = Vec::with_capacity(args.ticks as usize);
 
     println!(
-        "gridwake-sim scenario={} clients={} entities={} ticks={} tick_rate_hz={} radius={} budget={}",
+        "gridwake-sim scenario={} clients={} entities={} ticks={} tick_rate_hz={} radius={} budget={} report={}",
         args.scenario.as_str(),
         args.clients,
         args.entities,
         args.ticks,
         args.tick_rate_hz,
         args.interest_radius,
-        args.byte_budget
+        args.byte_budget,
+        args.report.as_str()
     );
 
     for step in 0..args.ticks {
+        let step_started = Instant::now();
         move_entities(&mut runtime, args, step);
         transport.clear();
+        let runtime_started = Instant::now();
         let mut due_metrics = runtime.advance_elapsed(
             &mut scheduler,
             tick_interval,
             &mut transport,
             &mut metrics_sink,
         );
+        let runtime_micros = runtime_started.elapsed().as_micros();
         let metrics = due_metrics
             .pop()
             .expect("one fixed scheduler tick should be due per simulation step");
         assert!(due_metrics.is_empty());
-        total_selected += metrics.selected_updates;
-        total_bytes += metrics.bytes_scheduled;
-        total_candidates += metrics.aoi_candidates;
+        let step_micros = step_started.elapsed().as_micros();
+        samples.push(TickSample {
+            runtime_micros,
+            step_micros,
+            aoi_candidates: metrics.aoi_candidates,
+            selected_updates: metrics.selected_updates,
+            exit_updates: metrics.exit_updates,
+            bytes_scheduled: metrics.bytes_scheduled,
+            messages_sent: metrics.messages_sent,
+        });
 
         println!(
-            "tick={} candidates={} selected={} exits={} bytes={} messages={}",
+            "tick={} runtime_ms={:.3} step_ms={:.3} candidates={} selected={} exits={} bytes={} messages={} avg_aoi_per_client={:.2} bytes_per_client={:.2}",
             metrics.tick.raw(),
+            micros_to_ms(runtime_micros),
+            micros_to_ms(step_micros),
             metrics.aoi_candidates,
             metrics.selected_updates,
             metrics.exit_updates,
             metrics.bytes_scheduled,
-            metrics.messages_sent
+            metrics.messages_sent,
+            metrics.aoi_candidates as f64 / args.clients as f64,
+            metrics.bytes_scheduled as f64 / args.clients as f64
         );
     }
 
     let elapsed = started.elapsed();
-    println!(
-        "summary elapsed_ms={} avg_candidates_per_tick={:.2} avg_selected_per_tick={:.2} avg_bytes_per_tick={:.2}",
-        elapsed.as_millis(),
-        total_candidates as f64 / args.ticks as f64,
-        total_selected as f64 / args.ticks as f64,
-        total_bytes as f64 / args.ticks as f64
-    );
+    let report = SimReport {
+        args,
+        samples,
+        elapsed_micros: elapsed.as_micros(),
+    };
+    print_report(&report);
 
     ExitCode::SUCCESS
 }
@@ -159,6 +287,10 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<SimArgs, String> {
             "--entities" => parsed.entities = parse_positive(&arg, &value)?,
             "--ticks" => parsed.ticks = parse_positive(&arg, &value)?,
             "--tick-rate" => parsed.tick_rate_hz = parse_positive(&arg, &value)?,
+            "--report" => {
+                parsed.report = ReportFormat::parse(&value)
+                    .ok_or_else(|| format!("unknown report format {value}"))?;
+            }
             "--scenario" => {
                 parsed.scenario =
                     Scenario::parse(&value).ok_or_else(|| format!("unknown scenario {value}"))?;
@@ -198,8 +330,76 @@ fn parse_f32(name: &str, value: &str) -> Result<f32, String> {
 
 fn print_usage() {
     eprintln!(
-        "usage: cargo run -p gridwake-sim -- [--scenario uniform|dense-hotspot|moving-battlefront|sparse-open-world] [--clients N] [--entities N] [--ticks N] [--tick-rate HZ] [--world-size N] [--radius N] [--budget N]"
+        "usage: cargo run -p gridwake-sim -- [--scenario uniform|dense-hotspot|moving-battlefront|sparse-open-world] [--clients N] [--entities N] [--ticks N] [--tick-rate HZ] [--world-size N] [--radius N] [--budget N] [--report text|json]"
     );
+}
+
+fn print_report(report: &SimReport) {
+    match report.args.report {
+        ReportFormat::Text => print_text_report(report),
+        ReportFormat::Json => print_json_report(report),
+    }
+}
+
+fn print_text_report(report: &SimReport) {
+    println!(
+        "summary elapsed_ms={:.3} avg_runtime_ms={:.3} max_runtime_ms={:.3} avg_step_ms={:.3} avg_candidates_per_tick={:.2} avg_aoi_per_client_tick={:.2} avg_selected_per_tick={:.2} avg_bytes_per_tick={:.2} avg_bytes_per_client_tick={:.2} avg_messages_per_tick={:.2} total_exits={}",
+        micros_to_ms(report.elapsed_micros),
+        report.avg_runtime_ms(),
+        report.max_runtime_ms(),
+        report.avg_step_ms(),
+        report.avg_candidates_per_tick(),
+        report.avg_candidates_per_client_tick(),
+        report.avg_selected_per_tick(),
+        report.avg_bytes_per_tick(),
+        report.avg_bytes_per_client_tick(),
+        report.avg_messages_per_tick(),
+        report.total_exits()
+    );
+}
+
+fn print_json_report(report: &SimReport) {
+    println!(
+        "summary_json={{\"scenario\":\"{}\",\"clients\":{},\"entities\":{},\"ticks\":{},\"tick_rate_hz\":{},\"world_size\":{},\"interest_radius\":{},\"byte_budget\":{},\"elapsed_ms\":{:.3},\"avg_runtime_ms\":{:.3},\"max_runtime_ms\":{:.3},\"avg_step_ms\":{:.3},\"avg_candidates_per_tick\":{:.3},\"avg_aoi_per_client_tick\":{:.3},\"avg_selected_per_tick\":{:.3},\"avg_bytes_per_tick\":{:.3},\"avg_bytes_per_client_tick\":{:.3},\"avg_messages_per_tick\":{:.3},\"total_exits\":{}}}",
+        report.args.scenario.as_str(),
+        report.args.clients,
+        report.args.entities,
+        report.args.ticks,
+        report.args.tick_rate_hz,
+        report.args.world_size,
+        report.args.interest_radius,
+        report.args.byte_budget,
+        micros_to_ms(report.elapsed_micros),
+        report.avg_runtime_ms(),
+        report.max_runtime_ms(),
+        report.avg_step_ms(),
+        report.avg_candidates_per_tick(),
+        report.avg_candidates_per_client_tick(),
+        report.avg_selected_per_tick(),
+        report.avg_bytes_per_tick(),
+        report.avg_bytes_per_client_tick(),
+        report.avg_messages_per_tick(),
+        report.total_exits()
+    );
+}
+
+fn micros_to_ms(micros: u128) -> f64 {
+    micros as f64 / 1_000.0
+}
+
+fn avg_micros(values: impl Iterator<Item = u128>) -> f64 {
+    let mut total = 0u128;
+    let mut count = 0u128;
+    for value in values {
+        total += value;
+        count += 1;
+    }
+
+    if count == 0 {
+        0.0
+    } else {
+        micros_to_ms(total / count)
+    }
 }
 
 fn seed_clients(runtime: &mut ServerRuntime, args: SimArgs) {

@@ -38,7 +38,7 @@ cargo test --workspace
 cargo run -p gridwake-sim -- --scenario uniform --clients 100 --entities 1000 --ticks 10 --tick-rate 20
 cargo run -p gridwake-sim -- --scenario dense-hotspot --clients 100 --entities 1000 --ticks 10
 cargo run -p gridwake-sim -- --scenario moving-battlefront --clients 100 --entities 1000 --ticks 10
-cargo run -p gridwake-sim -- --scenario sparse-open-world --clients 100 --entities 1000 --ticks 10
+cargo run -p gridwake-sim -- --scenario sparse-open-world --clients 100 --entities 1000 --ticks 10 --report json
 ```
 
 ## Non-Goals
