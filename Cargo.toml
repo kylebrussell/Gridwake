@@ -1,0 +1,37 @@
+[workspace]
+members = [
+    "crates/core",
+    "crates/aoi",
+    "crates/replication",
+    "crates/snapshot",
+    "crates/protocol",
+    "crates/server",
+    "crates/sim",
+]
+default-members = [
+    "crates/core",
+    "crates/aoi",
+    "crates/replication",
+    "crates/snapshot",
+    "crates/protocol",
+    "crates/server",
+    "crates/sim",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/gridwake/gridwake"
+homepage = "https://github.com/gridwake/gridwake"
+description = "Engine-neutral server-authoritative multiplayer runtime primitives."
+keywords = ["gamedev", "multiplayer", "replication", "server", "aoi"]
+categories = ["game-development", "network-programming"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"

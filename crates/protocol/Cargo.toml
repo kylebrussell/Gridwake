@@ -1,0 +1,18 @@
+[package]
+name = "gridwake-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Transport-neutral Gridwake protocol message types."
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+gridwake-core = { path = "../core" }
+gridwake-snapshot = { path = "../snapshot" }
+
+[lints]
+workspace = true

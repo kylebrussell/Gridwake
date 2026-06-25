@@ -1,0 +1,14 @@
+[package]
+name = "gridwake-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Core ids, ticks, budgets, and math-neutral types for Gridwake."
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true

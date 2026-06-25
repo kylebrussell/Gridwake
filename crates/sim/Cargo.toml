@@ -1,0 +1,18 @@
+[package]
+name = "gridwake-sim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Gridwake synthetic load-test harness."
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+gridwake-core = { path = "../core" }
+gridwake-server = { path = "../server" }
+
+[lints]
+workspace = true

@@ -1,0 +1,21 @@
+[package]
+name = "gridwake-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Authoritative runtime shell for Gridwake."
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+gridwake-aoi = { path = "../aoi" }
+gridwake-core = { path = "../core" }
+gridwake-protocol = { path = "../protocol" }
+gridwake-replication = { path = "../replication" }
+gridwake-snapshot = { path = "../snapshot" }
+
+[lints]
+workspace = true
