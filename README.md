@@ -12,7 +12,7 @@ The project is intentionally not a renderer, editor, physics engine, matchmaking
 | `gridwake-aoi` | Spatial interest management with a grid-backed AOI index. |
 | `gridwake-replication` | Per-client visibility, dirty generations, priority accumulation, and byte-budgeted selection. |
 | `gridwake-snapshot` | Snapshot frames, delta ops, retained baseline history, and ack tracking. |
-| `gridwake-protocol` | Transport-neutral client/server message enums and metric frames. |
+| `gridwake-protocol` | Transport-neutral client/server message enums, metric frames, and a versioned byte codec. |
 | `gridwake-server` | Authoritative runtime shell using fake transport, inbound message pumping, fixed-step scheduling, metrics sinks, AOI, replication, acked snapshot deltas, bounded lag-history hooks, cell ownership, and cross-cell event outboxes. |
 | `gridwake-sim` | Runnable load-test harness with fake clients, fake entities, fixed-step ticks, and named synthetic scenarios. |
 
@@ -46,7 +46,7 @@ cargo run -p gridwake-sim -- --scenario sparse-open-world --clients 100 --entiti
 - No renderer, editor, scene graph, animation system, or physics engine.
 - No matchmaking, account system, lobby service, or hosted backend replacement.
 - No hard dependency on Bevy, Unity, Unreal, Godot, or any ECS.
-- No real transport until the replication model is proven over fake transport.
+- No hard dependency on a real transport; transports should use the protocol codec once adapters are added.
 
 ## License
 

@@ -10,7 +10,7 @@ The workspace uses crate-level boundaries so each subsystem can be tested indepe
 - `gridwake-aoi` indexes observer and entity positions. The first index is a uniform grid suitable for predictable tests and synthetic worlds.
 - `gridwake-replication` tracks client visibility, entity dirty generations, priority accumulation, and byte-budgeted update selection.
 - `gridwake-snapshot` represents snapshot frames and delta operations without choosing a serializer or transport.
-- `gridwake-protocol` contains transport-neutral messages.
+- `gridwake-protocol` contains transport-neutral messages and a small versioned byte codec.
 - `gridwake-server` composes the crates into an authoritative fixed-step tick shell, pumps inbound client messages, records metrics through sinks, retains bounded entity-position history for lag-compensation hooks, and tracks cell ownership for local versus cross-region event routing into region outboxes.
 - `gridwake-sim` drives fake clients and entities through deterministic synthetic scenarios using the same fixed-step scheduler.
 
@@ -26,6 +26,15 @@ game/sim state
 ```
 
 The initial runtime sends snapshot delta operations through an in-process fake transport. Runtime history carries forward each client's known state, then diffs it against the latest retained acked baseline so dropped snapshots can be repaired by later deltas. Real transports should implement the same boundary later.
+
+The protocol codec is intentionally narrow and dependency-free:
+
+```text
+typed client/server message
+  -> Gridwake wire header
+  -> little-endian ids, ticks, counts, payload lengths
+  -> bounded decode config for payload and delta-op limits
+```
 
 The runtime can also be driven by elapsed wall-clock time:
 
@@ -60,6 +69,7 @@ source position/cell + target position/cell
 - Server authoritative by default.
 - Engine-neutral ids and payloads.
 - Transport-neutral messages.
+- Versioned message codec for future transport adapters.
 - AOI filtering before replication scheduling.
 - Byte budgets enforced per client.
 - Priority accumulation to reduce starvation.
@@ -72,7 +82,7 @@ source position/cell + target position/cell
 ## Near-Term Gaps
 
 - Cell/region ownership has in-process region outboxes; multi-worker dispatch is not implemented yet.
-- Snapshot baselines are retained per client and used for runtime deltas; binary serialization and payload-level compression are not implemented yet.
+- Snapshot baselines are retained per client and used for runtime deltas; payload-level compression is not implemented yet.
 - Lag-compensation support is exact-position history only; interpolation, hit shapes, and rewind physics are not implemented yet.
-- Serialization is intentionally absent; protocol messages are typed Rust values.
+- Real socket transport adapters are not implemented yet.
 - The simulation harness has deterministic named scenarios and fixed-step ticking, but still needs sustained benchmark reporting and larger default profiles.
