@@ -3,7 +3,10 @@ use std::time::Duration;
 
 use gridwake_aoi::{CellCoord, GridAoi, GridAoiConfig, InterestIndex};
 use gridwake_core::{ByteBudget, ClientId, EntityId, RegionId, SnapshotId, Tick, Vec3};
-use gridwake_protocol::{ClientMessage, MetricsFrame, RoutedClientMessage, ServerMessage};
+use gridwake_protocol::{
+    decode_client_message_with_config, encode_client_message, encode_server_message, ClientMessage,
+    CodecError, DecodeConfig, MetricsFrame, RoutedClientMessage, ServerMessage,
+};
 use gridwake_replication::{ReplicationGraph, VisibilityChange};
 use gridwake_snapshot::{build_delta, AckTracker, DeltaOp, SnapshotFrame, SnapshotHistory};
 
@@ -110,6 +113,130 @@ pub trait Transport {
 
     fn drain_received(&mut self) -> Vec<RoutedClientMessage> {
         Vec::new()
+    }
+}
+
+pub trait ByteTransport {
+    fn send_bytes(&mut self, client: ClientId, bytes: Vec<u8>);
+
+    fn drain_received_bytes(&mut self) -> Vec<RoutedClientBytes> {
+        Vec::new()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoutedClientBytes {
+    pub client: ClientId,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TransportCodecError {
+    EncodeServer { client: ClientId, error: CodecError },
+    DecodeClient { client: ClientId, error: CodecError },
+}
+
+#[derive(Debug)]
+pub struct CodecTransport<T> {
+    inner: T,
+    decode_config: DecodeConfig,
+    errors: Vec<TransportCodecError>,
+}
+
+impl<T> CodecTransport<T> {
+    pub fn new(inner: T) -> Self {
+        Self {
+            inner,
+            decode_config: DecodeConfig::default(),
+            errors: Vec::new(),
+        }
+    }
+
+    pub fn with_decode_config(inner: T, decode_config: DecodeConfig) -> Self {
+        Self {
+            inner,
+            decode_config,
+            errors: Vec::new(),
+        }
+    }
+
+    pub fn inner(&self) -> &T {
+        &self.inner
+    }
+
+    pub fn inner_mut(&mut self) -> &mut T {
+        &mut self.inner
+    }
+
+    pub fn into_inner(self) -> T {
+        self.inner
+    }
+
+    pub fn errors(&self) -> &[TransportCodecError] {
+        &self.errors
+    }
+
+    pub fn take_errors(&mut self) -> Vec<TransportCodecError> {
+        std::mem::take(&mut self.errors)
+    }
+}
+
+impl<T: ByteTransport> Transport for CodecTransport<T> {
+    fn send(&mut self, client: ClientId, message: ServerMessage) {
+        match encode_server_message(&message) {
+            Ok(bytes) => self.inner.send_bytes(client, bytes),
+            Err(error) => self
+                .errors
+                .push(TransportCodecError::EncodeServer { client, error }),
+        }
+    }
+
+    fn drain_received(&mut self) -> Vec<RoutedClientMessage> {
+        let mut messages = Vec::new();
+        for RoutedClientBytes { client, bytes } in self.inner.drain_received_bytes() {
+            match decode_client_message_with_config(&bytes, self.decode_config) {
+                Ok(message) => messages.push(RoutedClientMessage { client, message }),
+                Err(error) => self
+                    .errors
+                    .push(TransportCodecError::DecodeClient { client, error }),
+            }
+        }
+        messages
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct MemoryByteTransport {
+    pub sent: Vec<(ClientId, Vec<u8>)>,
+    pub received: Vec<RoutedClientBytes>,
+}
+
+impl MemoryByteTransport {
+    pub fn clear(&mut self) {
+        self.sent.clear();
+    }
+
+    pub fn push_received_bytes(&mut self, client: ClientId, bytes: Vec<u8>) {
+        self.received.push(RoutedClientBytes { client, bytes });
+    }
+
+    pub fn push_received_message(
+        &mut self,
+        client: ClientId,
+        message: &ClientMessage,
+    ) -> Result<(), CodecError> {
+        self.push_received_bytes(client, encode_client_message(message)?);
+        Ok(())
+    }
+}
+
+impl ByteTransport for MemoryByteTransport {
+    fn send_bytes(&mut self, client: ClientId, bytes: Vec<u8>) {
+        self.sent.push((client, bytes));
+    }
+
+    fn drain_received_bytes(&mut self) -> Vec<RoutedClientBytes> {
+        self.received.drain(..).collect()
     }
 }
 
@@ -627,6 +754,7 @@ impl ServerRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gridwake_protocol::decode_server_message;
     use gridwake_snapshot::DeltaOp;
 
     fn payload(id: u64) -> Vec<u8> {
@@ -830,6 +958,75 @@ mod tests {
             panic!("expected snapshot delta");
         };
         assert_eq!(delta.baseline, Some(SnapshotId::new(1)));
+    }
+
+    #[test]
+    fn codec_transport_decodes_inbound_bytes_and_encodes_outbound_messages() {
+        let mut runtime = ServerRuntime::new(ServerConfig {
+            tick_rate_hz: 10,
+            default_interest_radius: 10.0,
+            per_client_byte_budget: 100,
+            ..ServerConfig::default()
+        });
+        let client = ClientId::new(1);
+        let entity = EntityId::new(1);
+        let byte_transport = MemoryByteTransport::default();
+        let mut transport = CodecTransport::new(byte_transport);
+        let mut metrics = VecMetrics::default();
+        let mut scheduler = TickScheduler::from_hz(10, 4);
+
+        runtime.connect_client(client, Vec3::ZERO, None);
+        runtime.spawn_entity(entity, Vec3::ZERO, payload(entity.raw()), 16, 1.0);
+        runtime.advance_tick(&mut transport);
+
+        assert_eq!(transport.inner().sent.len(), 1);
+        let outbound = decode_server_message(&transport.inner().sent[0].1).unwrap();
+        assert!(matches!(outbound, ServerMessage::SnapshotDelta(_)));
+        transport.inner_mut().clear();
+
+        transport
+            .inner_mut()
+            .push_received_message(
+                client,
+                &ClientMessage::AckSnapshot {
+                    sequence: SnapshotId::new(1),
+                },
+            )
+            .unwrap();
+        runtime.set_entity_payload(entity, b"changed".to_vec());
+
+        runtime.advance_elapsed(
+            &mut scheduler,
+            Duration::from_millis(100),
+            &mut transport,
+            &mut metrics,
+        );
+
+        assert!(transport.errors().is_empty());
+        assert_eq!(transport.inner().sent.len(), 1);
+        let outbound = decode_server_message(&transport.inner().sent[0].1).unwrap();
+        let ServerMessage::SnapshotDelta(delta) = outbound else {
+            panic!("expected snapshot delta");
+        };
+        assert_eq!(delta.baseline, Some(SnapshotId::new(1)));
+    }
+
+    #[test]
+    fn codec_transport_records_decode_errors() {
+        let client = ClientId::new(1);
+        let mut transport = CodecTransport::new(MemoryByteTransport::default());
+        transport
+            .inner_mut()
+            .push_received_bytes(client, b"not-gridwake".to_vec());
+
+        assert!(transport.drain_received().is_empty());
+        assert_eq!(
+            transport.take_errors(),
+            vec![TransportCodecError::DecodeClient {
+                client,
+                error: CodecError::InvalidMagic
+            }]
+        );
     }
 
     #[test]
