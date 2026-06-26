@@ -36,6 +36,7 @@ struct Args {
     world_size: f32,
     interest_radius: f32,
     byte_budget: usize,
+    max_datagram_bytes: usize,
     log_every_ticks: u64,
 }
 
@@ -48,7 +49,8 @@ impl Default for Args {
             tick_rate_hz: 20,
             world_size: 512.0,
             interest_radius: 128.0,
-            byte_budget: 8_192,
+            byte_budget: 700,
+            max_datagram_bytes: 1_200,
             log_every_ticks: 20,
         }
     }
@@ -141,10 +143,12 @@ struct DemoUdpTransport {
     peers: HashMap<SocketAddr, ClientId>,
     next_client: u64,
     recv_buffer: Vec<u8>,
+    max_datagram_bytes: usize,
+    oversized_datagrams: u64,
 }
 
 impl DemoUdpTransport {
-    fn bind(addr: &str) -> io::Result<Self> {
+    fn bind(addr: &str, max_datagram_bytes: usize) -> io::Result<Self> {
         let socket = UdpSocket::bind(addr)?;
         socket.set_nonblocking(true)?;
         Ok(Self {
@@ -153,6 +157,8 @@ impl DemoUdpTransport {
             peers: HashMap::new(),
             next_client: 1,
             recv_buffer: vec![0; RECV_BUFFER_BYTES],
+            max_datagram_bytes,
+            oversized_datagrams: 0,
         })
     }
 
@@ -210,6 +216,18 @@ impl Transport for DemoUdpTransport {
 
         match encode_server_message(&message) {
             Ok(bytes) => {
+                if bytes.len() > self.max_datagram_bytes {
+                    self.oversized_datagrams = self.oversized_datagrams.saturating_add(1);
+                    if self.oversized_datagrams <= 3 || self.oversized_datagrams % 100 == 0 {
+                        eprintln!(
+                            "drop oversized datagram to client {} at {addr}: bytes={} max={}",
+                            client.raw(),
+                            bytes.len(),
+                            self.max_datagram_bytes
+                        );
+                    }
+                    return;
+                }
                 if let Err(error) = self.socket.send_to(&bytes, addr) {
                     eprintln!("send error to client {} at {addr}: {error}", client.raw());
                 }
@@ -238,18 +256,19 @@ fn main() -> io::Result<()> {
         per_client_byte_budget: args.byte_budget,
         ..ServerConfig::default()
     });
-    let mut transport = DemoUdpTransport::bind(&args.bind)?;
+    let mut transport = DemoUdpTransport::bind(&args.bind, args.max_datagram_bytes)?;
     let mut demo_entities = seed_demo_entities(&mut runtime, &args);
     let mut clients = HashMap::new();
 
     println!(
-        "gridwake Godot PSX demo server listening on {} bots={} effects={} tick_rate={} radius={} budget={}",
+        "gridwake Godot PSX demo server listening on {} bots={} effects={} tick_rate={} radius={} budget={} max_datagram={}",
         transport.local_addr()?,
         args.bots,
         args.effects,
         args.tick_rate_hz,
         args.interest_radius,
-        args.byte_budget
+        args.byte_budget,
+        args.max_datagram_bytes
     );
 
     let tick_interval = Duration::from_secs_f64(1.0 / f64::from(args.tick_rate_hz));
@@ -557,6 +576,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> io::Result<Args> {
             "--world-size" => parsed.world_size = parse_positive_f32(&arg, &value)?,
             "--radius" => parsed.interest_radius = parse_positive_f32(&arg, &value)?,
             "--budget" => parsed.byte_budget = parse_positive(&arg, &value)?,
+            "--max-datagram" => parsed.max_datagram_bytes = parse_positive(&arg, &value)?,
             "--log-every" => parsed.log_every_ticks = parse_positive(&arg, &value)?,
             _ => return Err(invalid_input(format!("unknown argument {arg}"))),
         }
@@ -566,7 +586,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> io::Result<Args> {
 
 fn print_usage() {
     eprintln!(
-        "usage: cargo run -p gridwake-server --example godot_psx_demo_server -- [--bind 127.0.0.1:3456] [--bots N] [--effects N] [--tick-rate HZ] [--world-size N] [--radius N] [--budget BYTES] [--log-every TICKS]"
+        "usage: cargo run -p gridwake-server --example godot_psx_demo_server -- [--bind 127.0.0.1:3456] [--bots N] [--effects N] [--tick-rate HZ] [--world-size N] [--radius N] [--budget BYTES] [--max-datagram BYTES] [--log-every TICKS]"
     );
 }
 

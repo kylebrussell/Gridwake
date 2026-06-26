@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use gridwake_core::{ByteBudget, ClientId, EntityId};
 
@@ -127,6 +127,13 @@ pub struct SelectedUpdate {
     pub first_for_client: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NetworkLodSelectionContext {
+    pub entity: EntityId,
+    pub default_lod: NetworkLod,
+    pub last_sent_lod: Option<NetworkLod>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Selection {
     pub updates: Vec<SelectedUpdate>,
@@ -145,9 +152,14 @@ pub struct ReplicationGraph {
 #[derive(Debug, Default)]
 struct ClientReplication {
     visible: HashSet<EntityId>,
-    last_sent_generation: HashMap<EntityId, u64>,
-    last_sent_lod: HashMap<EntityId, NetworkLod>,
-    priority_accumulator: HashMap<EntityId, f32>,
+    entities: HashMap<EntityId, ClientEntityReplication>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ClientEntityReplication {
+    last_sent_generation: u64,
+    last_sent_lod: Option<NetworkLod>,
+    priority_accumulator: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -161,6 +173,38 @@ struct Candidate {
     last_sent_generation: u64,
     last_sent_lod: Option<NetworkLod>,
     first_for_client: bool,
+}
+
+impl Candidate {
+    fn min_selectable_bytes(&self) -> usize {
+        lod_fallbacks(self.lod)
+            .last()
+            .map(|lod| self.lod_bytes.for_lod(*lod))
+            .unwrap_or(usize::MAX)
+    }
+}
+
+impl PartialEq for Candidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.entity == other.entity && self.score == other.score
+    }
+}
+
+impl Eq for Candidate {}
+
+impl PartialOrd for Candidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Candidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.score
+            .partial_cmp(&other.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| other.entity.cmp(&self.entity))
+    }
 }
 
 impl ReplicationGraph {
@@ -221,9 +265,7 @@ impl ReplicationGraph {
         let existed = self.entities.remove(&entity).is_some();
         for client in self.clients.values_mut() {
             client.visible.remove(&entity);
-            client.last_sent_generation.remove(&entity);
-            client.last_sent_lod.remove(&entity);
-            client.priority_accumulator.remove(&entity);
+            client.entities.remove(&entity);
         }
         existed
     }
@@ -258,9 +300,7 @@ impl ReplicationGraph {
         let mut visible: Vec<_> = next.iter().copied().collect();
 
         for entity in &exited {
-            client_state.priority_accumulator.remove(entity);
-            client_state.last_sent_generation.remove(entity);
-            client_state.last_sent_lod.remove(entity);
+            client_state.entities.remove(entity);
         }
 
         client_state.visible = next;
@@ -284,9 +324,9 @@ impl ReplicationGraph {
     pub fn last_sent_lod(&self, client: ClientId, entity: EntityId) -> Option<NetworkLod> {
         self.clients
             .get(&client)?
-            .last_sent_lod
+            .entities
             .get(&entity)
-            .copied()
+            .and_then(|state| state.last_sent_lod)
     }
 
     pub fn select_for_client(&mut self, client: ClientId, budget: ByteBudget) -> Selection {
@@ -296,41 +336,49 @@ impl ReplicationGraph {
     pub fn select_for_client_with_lod(
         &mut self,
         client: ClientId,
-        mut budget: ByteBudget,
+        budget: ByteBudget,
         mut lod_for_entity: impl FnMut(EntityId, NetworkLod) -> NetworkLod,
+    ) -> Selection {
+        self.select_for_client_with_lod_context(client, budget, |context| {
+            lod_for_entity(context.entity, context.default_lod)
+        })
+    }
+
+    pub fn select_for_client_with_lod_context(
+        &mut self,
+        client: ClientId,
+        mut budget: ByteBudget,
+        mut lod_for_entity: impl FnMut(NetworkLodSelectionContext) -> NetworkLod,
     ) -> Selection {
         let Some(client_state) = self.clients.get_mut(&client) else {
             return Selection::default();
         };
 
-        let mut candidates = Vec::new();
+        let mut candidates = Vec::with_capacity(client_state.visible.len());
         for &entity_id in &client_state.visible {
             let Some(entity) = self.entities.get(&entity_id) else {
                 continue;
             };
-            let lod = lod_for_entity(entity_id, entity.lod);
 
-            let last_sent = client_state
-                .last_sent_generation
-                .get(&entity_id)
-                .copied()
-                .unwrap_or(0);
-            let last_sent_lod = client_state.last_sent_lod.get(&entity_id).copied();
+            let client_entity = client_state.entities.entry(entity_id).or_default();
+            let last_sent = client_entity.last_sent_generation;
+            let last_sent_lod = client_entity.last_sent_lod;
+            let lod = lod_for_entity(NetworkLodSelectionContext {
+                entity: entity_id,
+                default_lod: entity.lod,
+                last_sent_lod,
+            });
             if entity.generation <= last_sent && last_sent_lod == Some(lod) {
                 continue;
             }
 
-            let accumulator = client_state
-                .priority_accumulator
-                .entry(entity_id)
-                .or_default();
-            *accumulator += entity.base_priority;
+            client_entity.priority_accumulator += entity.base_priority;
             candidates.push(Candidate {
                 entity: entity_id,
                 estimated_bytes: entity.lod_bytes.for_lod(lod),
                 lod_bytes: entity.lod_bytes,
                 lod,
-                score: *accumulator,
+                score: client_entity.priority_accumulator,
                 generation: entity.generation,
                 last_sent_generation: last_sent,
                 last_sent_lod,
@@ -338,19 +386,27 @@ impl ReplicationGraph {
             });
         }
 
-        candidates.sort_by(|left, right| {
-            right
-                .score
-                .partial_cmp(&left.score)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| left.entity.cmp(&right.entity))
-        });
+        let min_selectable_bytes = candidates
+            .iter()
+            .map(Candidate::min_selectable_bytes)
+            .min()
+            .unwrap_or(usize::MAX);
+        let mut candidates = BinaryHeap::from(candidates);
 
         let starting_bytes = budget.remaining();
-        let mut updates = Vec::new();
+        let mut updates = Vec::with_capacity(candidates.len());
         let mut deferred_updates = 0;
         let mut deferred_bytes: usize = 0;
-        for candidate in candidates {
+        while let Some(candidate) = candidates.pop() {
+            if budget.remaining() < min_selectable_bytes {
+                deferred_updates += 1 + candidates.len();
+                deferred_bytes = deferred_bytes.saturating_add(candidate.estimated_bytes);
+                deferred_bytes = candidates.iter().fold(deferred_bytes, |bytes, candidate| {
+                    bytes.saturating_add(candidate.estimated_bytes)
+                });
+                break;
+            }
+
             let Some((lod, bytes)) = select_lod_for_budget(&candidate, budget.remaining()) else {
                 deferred_updates += 1;
                 deferred_bytes = deferred_bytes.saturating_add(candidate.estimated_bytes);
@@ -365,12 +421,18 @@ impl ReplicationGraph {
             }
 
             client_state
-                .priority_accumulator
-                .insert(candidate.entity, 0.0);
-            client_state
-                .last_sent_generation
-                .insert(candidate.entity, candidate.generation);
-            client_state.last_sent_lod.insert(candidate.entity, lod);
+                .entities
+                .entry(candidate.entity)
+                .and_modify(|state| {
+                    state.priority_accumulator = 0.0;
+                    state.last_sent_generation = candidate.generation;
+                    state.last_sent_lod = Some(lod);
+                })
+                .or_insert(ClientEntityReplication {
+                    last_sent_generation: candidate.generation,
+                    last_sent_lod: Some(lod),
+                    priority_accumulator: 0.0,
+                });
             updates.push(SelectedUpdate {
                 entity: candidate.entity,
                 estimated_bytes: bytes,

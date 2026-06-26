@@ -107,7 +107,7 @@ const OP_UPDATE: u8 = 0x02;
 const OP_DESPAWN_OR_EXIT: u8 = 0x03;
 
 pub fn encode_client_message(message: &ClientMessage) -> Result<Vec<u8>, CodecError> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(encoded_client_message_len(message)?);
     write_header(
         &mut out,
         match message {
@@ -148,7 +148,7 @@ pub fn decode_client_message_with_config(
 }
 
 pub fn encode_server_message(message: &ServerMessage) -> Result<Vec<u8>, CodecError> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(encoded_server_message_len(message)?);
     write_header(
         &mut out,
         match message {
@@ -163,6 +163,22 @@ pub fn encode_server_message(message: &ServerMessage) -> Result<Vec<u8>, CodecEr
     }
 
     Ok(out)
+}
+
+pub fn encoded_client_message_len(message: &ClientMessage) -> Result<usize, CodecError> {
+    let body_len = match message {
+        ClientMessage::AckSnapshot { .. } => U64_BYTES,
+        ClientMessage::Input { payload } => encoded_bytes_len(payload)?,
+    };
+    Ok(HEADER_BYTES + body_len)
+}
+
+pub fn encoded_server_message_len(message: &ServerMessage) -> Result<usize, CodecError> {
+    let body_len = match message {
+        ServerMessage::SnapshotDelta(delta) => encoded_delta_snapshot_len(delta)?,
+        ServerMessage::Metrics(_) => METRICS_BODY_BYTES,
+    };
+    Ok(HEADER_BYTES + body_len)
 }
 
 pub fn decode_server_message(bytes: &[u8]) -> Result<ServerMessage, CodecError> {
@@ -190,6 +206,35 @@ fn write_header(out: &mut Vec<u8>, tag: u8) {
     out.extend_from_slice(&PROTOCOL_MAGIC);
     out.push(PROTOCOL_VERSION);
     out.push(tag);
+}
+
+const HEADER_BYTES: usize = PROTOCOL_MAGIC.len() + 2;
+const U32_BYTES: usize = 4;
+const U64_BYTES: usize = 8;
+const METRICS_BODY_BYTES: usize = U64_BYTES * 11;
+
+fn encoded_delta_snapshot_len(delta: &DeltaSnapshot) -> Result<usize, CodecError> {
+    checked_count(delta.ops.len())?;
+    let mut len = U64_BYTES + 1 + U32_BYTES;
+    if delta.baseline.is_some() {
+        len += U64_BYTES;
+    }
+
+    for op in &delta.ops {
+        len += match op {
+            DeltaOp::SpawnOrEnter { payload, .. } | DeltaOp::Update { payload, .. } => {
+                1 + U64_BYTES + encoded_bytes_len(payload)?
+            }
+            DeltaOp::DespawnOrExit { .. } => 1 + U64_BYTES,
+        };
+    }
+
+    Ok(len)
+}
+
+fn encoded_bytes_len(bytes: &[u8]) -> Result<usize, CodecError> {
+    checked_len(bytes.len())?;
+    Ok(U32_BYTES + bytes.len())
 }
 
 fn write_delta_snapshot(out: &mut Vec<u8>, delta: &DeltaSnapshot) -> Result<(), CodecError> {
@@ -444,6 +489,48 @@ mod tests {
     }
 
     #[test]
+    fn encoded_server_snapshot_len_matches_wire_bytes() {
+        let message = ServerMessage::SnapshotDelta(DeltaSnapshot {
+            sequence: SnapshotId::new(10),
+            baseline: None,
+            ops: vec![
+                DeltaOp::SpawnOrEnter {
+                    entity: EntityId::new(1),
+                    payload: vec![0; 24],
+                },
+                DeltaOp::Update {
+                    entity: EntityId::new(2),
+                    payload: vec![0; 36],
+                },
+                DeltaOp::DespawnOrExit {
+                    entity: EntityId::new(3),
+                },
+            ],
+        });
+
+        let encoded = encode_server_message(&message).unwrap();
+
+        assert_eq!(encoded_server_message_len(&message).unwrap(), encoded.len());
+        assert_eq!(
+            encoded.len(),
+            HEADER_BYTES
+                + U64_BYTES
+                + 1
+                + U32_BYTES
+                + 1
+                + U64_BYTES
+                + U32_BYTES
+                + 24
+                + 1
+                + U64_BYTES
+                + U32_BYTES
+                + 36
+                + 1
+                + U64_BYTES
+        );
+    }
+
+    #[test]
     fn server_metrics_round_trips() {
         let message = ServerMessage::Metrics(MetricsFrame {
             tick: Tick::new(123),
@@ -461,6 +548,7 @@ mod tests {
 
         let encoded = encode_server_message(&message).unwrap();
 
+        assert_eq!(encoded_server_message_len(&message).unwrap(), encoded.len());
         assert_eq!(decode_server_message(&encoded).unwrap(), message);
     }
 

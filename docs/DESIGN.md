@@ -53,6 +53,12 @@ The first real socket adapter is a dependency-free UDP byte transport. It regist
 
 The Godot demo uses the same protocol boundary from a non-Rust engine. It keeps engine code limited to input encoding, snapshot decoding, acknowledgement, and presentation, while the Rust server remains authoritative over AOI, replication priority, LOD choice, and snapshot deltas.
 
+Current replication byte budgets apply to selected payload bytes before protocol
+envelope and per-op overhead. Until snapshot fragmentation or wire-size-aware
+budgeting exists, UDP demo budgets should stay conservative enough for encoded
+datagrams; the demo transport drops oversized datagrams instead of relying on
+platform `send_to` errors.
+
 The runtime can also be driven by elapsed wall-clock time:
 
 ```text

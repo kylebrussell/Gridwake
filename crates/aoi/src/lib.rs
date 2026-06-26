@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use gridwake_core::{ClientId, EntityId, Vec3};
 
@@ -49,6 +49,9 @@ pub struct GridAoi {
     observers: HashMap<ClientId, ObserverEntry>,
     entities: HashMap<EntityId, EntityEntry>,
     cells: HashMap<CellCoord, HashSet<EntityId>>,
+    occupied_x_layers: BTreeMap<i32, usize>,
+    occupied_y_layers: BTreeMap<i32, usize>,
+    occupied_z_layers: BTreeMap<i32, usize>,
 }
 
 impl GridAoi {
@@ -58,6 +61,9 @@ impl GridAoi {
             observers: HashMap::new(),
             entities: HashMap::new(),
             cells: HashMap::new(),
+            occupied_x_layers: BTreeMap::new(),
+            occupied_y_layers: BTreeMap::new(),
+            occupied_z_layers: BTreeMap::new(),
         }
     }
 
@@ -79,23 +85,43 @@ impl GridAoi {
     }
 
     fn insert_entity_into_cell(&mut self, entity: EntityId, cell: CellCoord) {
-        self.cells.entry(cell).or_default().insert(entity);
+        let inserted = self.cells.entry(cell).or_default().insert(entity);
+        if inserted {
+            self.increment_occupied_layers(cell);
+        }
     }
 
     fn remove_entity_from_cell(&mut self, entity: EntityId, cell: CellCoord) {
+        let mut removed = false;
         let should_remove_cell = if let Some(entities) = self.cells.get_mut(&cell) {
-            entities.remove(&entity);
+            removed = entities.remove(&entity);
             entities.is_empty()
         } else {
             false
         };
+
+        if removed {
+            self.decrement_occupied_layers(cell);
+        }
 
         if should_remove_cell {
             self.cells.remove(&cell);
         }
     }
 
-    fn cells_for_sphere(&self, center: Vec3, radius: f32) -> impl Iterator<Item = CellCoord> {
+    fn increment_occupied_layers(&mut self, cell: CellCoord) {
+        *self.occupied_x_layers.entry(cell.x).or_default() += 1;
+        *self.occupied_y_layers.entry(cell.y).or_default() += 1;
+        *self.occupied_z_layers.entry(cell.z).or_default() += 1;
+    }
+
+    fn decrement_occupied_layers(&mut self, cell: CellCoord) {
+        decrement_layer(&mut self.occupied_x_layers, cell.x);
+        decrement_layer(&mut self.occupied_y_layers, cell.y);
+        decrement_layer(&mut self.occupied_z_layers, cell.z);
+    }
+
+    fn cell_bounds_for_sphere(&self, center: Vec3, radius: f32) -> (CellCoord, CellCoord) {
         assert!(radius.is_finite() && radius >= 0.0);
         let min = self.cell_for_position(Vec3::new(
             center.x - radius,
@@ -108,9 +134,52 @@ impl GridAoi {
             center.z + radius,
         ));
 
-        (min.x..=max.x).flat_map(move |x| {
-            (min.y..=max.y).flat_map(move |y| (min.z..=max.z).map(move |z| CellCoord { x, y, z }))
-        })
+        (min, max)
+    }
+
+    pub fn query_observer_into(&self, observer: ClientId, out: &mut Vec<EntityId>) -> bool {
+        out.clear();
+        let Some(observer) = self.observers.get(&observer) else {
+            return false;
+        };
+
+        let radius_squared = observer.radius * observer.radius;
+        let (min, max) = self.cell_bounds_for_sphere(observer.position, observer.radius);
+        for (&x, _) in self.occupied_x_layers.range(min.x..=max.x) {
+            for (&y, _) in self.occupied_y_layers.range(min.y..=max.y) {
+                for (&z, _) in self.occupied_z_layers.range(min.z..=max.z) {
+                    let cell = CellCoord { x, y, z };
+                    let Some(cell_entities) = self.cells.get(&cell) else {
+                        continue;
+                    };
+
+                    for &entity in cell_entities {
+                        let Some(entry) = self.entities.get(&entity) else {
+                            continue;
+                        };
+
+                        if observer.position.distance_squared(entry.position) <= radius_squared {
+                            out.push(entity);
+                        }
+                    }
+                }
+            }
+        }
+
+        true
+    }
+}
+
+fn decrement_layer(layers: &mut BTreeMap<i32, usize>, layer: i32) {
+    let should_remove = if let Some(count) = layers.get_mut(&layer) {
+        *count = count.saturating_sub(1);
+        *count == 0
+    } else {
+        false
+    };
+
+    if should_remove {
+        layers.remove(&layer);
     }
 }
 
@@ -174,29 +243,9 @@ impl InterestIndex for GridAoi {
     }
 
     fn query_observer(&self, observer: ClientId) -> Option<Vec<EntityId>> {
-        let observer = self.observers.get(&observer)?;
-        let radius_squared = observer.radius * observer.radius;
-        let mut seen = HashSet::new();
         let mut entities = Vec::new();
-
-        for cell in self.cells_for_sphere(observer.position, observer.radius) {
-            let Some(cell_entities) = self.cells.get(&cell) else {
-                continue;
-            };
-
-            for &entity in cell_entities {
-                if !seen.insert(entity) {
-                    continue;
-                }
-
-                let Some(entry) = self.entities.get(&entity) else {
-                    continue;
-                };
-
-                if observer.position.distance_squared(entry.position) <= radius_squared {
-                    entities.push(entity);
-                }
-            }
+        if !self.query_observer_into(observer, &mut entities) {
+            return None;
         }
 
         entities.sort_unstable();

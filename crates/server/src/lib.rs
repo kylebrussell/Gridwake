@@ -55,35 +55,52 @@ impl NetworkLodPolicy {
 
         let full_ratio = normalized_ratio(self.full_distance_ratio, 0.35);
         let reduced_ratio = normalized_ratio(self.reduced_distance_ratio, 0.75).max(full_ratio);
-        let distance_ratio = (distance_squared.sqrt() / interest_radius).clamp(0.0, 1.0);
+        let radius_squared = interest_radius * interest_radius;
+        let distance_squared = distance_squared.min(radius_squared);
         let Some(previous_lod) = previous_lod else {
-            return classify_network_lod(distance_ratio, full_ratio, reduced_ratio);
+            return classify_network_lod_squared(
+                distance_squared,
+                interest_radius,
+                full_ratio,
+                reduced_ratio,
+            );
         };
         let hysteresis = normalized_ratio(self.hysteresis_ratio, 0.05);
 
         match previous_lod {
             NetworkLod::Full => {
-                if distance_ratio <= (full_ratio + hysteresis).min(1.0) {
+                if distance_squared <= threshold_squared(interest_radius, full_ratio + hysteresis) {
                     NetworkLod::Full
-                } else if distance_ratio <= (reduced_ratio + hysteresis).min(1.0) {
+                } else if distance_squared
+                    <= threshold_squared(interest_radius, reduced_ratio + hysteresis)
+                {
                     NetworkLod::Reduced
                 } else {
                     NetworkLod::Minimal
                 }
             }
             NetworkLod::Reduced => {
-                if distance_ratio <= (full_ratio - hysteresis).max(0.0) {
+                if distance_squared <= threshold_squared(interest_radius, full_ratio - hysteresis) {
                     NetworkLod::Full
-                } else if distance_ratio > (reduced_ratio + hysteresis).min(1.0) {
+                } else if distance_squared
+                    > threshold_squared(interest_radius, reduced_ratio + hysteresis)
+                {
                     NetworkLod::Minimal
                 } else {
                     NetworkLod::Reduced
                 }
             }
             NetworkLod::Minimal => {
-                if distance_ratio > (reduced_ratio - hysteresis).max(full_ratio) {
+                if distance_squared
+                    > threshold_squared(
+                        interest_radius,
+                        (reduced_ratio - hysteresis).max(full_ratio),
+                    )
+                {
                     NetworkLod::Minimal
-                } else if distance_ratio <= (full_ratio - hysteresis).max(0.0) {
+                } else if distance_squared
+                    <= threshold_squared(interest_radius, full_ratio - hysteresis)
+                {
                     NetworkLod::Full
                 } else {
                     NetworkLod::Reduced
@@ -93,14 +110,24 @@ impl NetworkLodPolicy {
     }
 }
 
-fn classify_network_lod(distance_ratio: f32, full_ratio: f32, reduced_ratio: f32) -> NetworkLod {
-    if distance_ratio <= full_ratio {
+fn classify_network_lod_squared(
+    distance_squared: f32,
+    interest_radius: f32,
+    full_ratio: f32,
+    reduced_ratio: f32,
+) -> NetworkLod {
+    if distance_squared <= threshold_squared(interest_radius, full_ratio) {
         NetworkLod::Full
-    } else if distance_ratio <= reduced_ratio {
+    } else if distance_squared <= threshold_squared(interest_radius, reduced_ratio) {
         NetworkLod::Reduced
     } else {
         NetworkLod::Minimal
     }
+}
+
+fn threshold_squared(interest_radius: f32, ratio: f32) -> f32 {
+    let distance = interest_radius * ratio.clamp(0.0, 1.0);
+    distance * distance
 }
 
 fn normalized_ratio(value: f32, fallback: f32) -> f32 {
@@ -1153,17 +1180,49 @@ impl ServerRuntime {
 
         let mut clients: Vec<_> = self.clients.keys().copied().collect();
         clients.sort_unstable();
+        let mut visible_entities = Vec::new();
 
         for client in clients {
-            let visible = self.aoi.query_observer(client).unwrap_or_default();
-            metrics.aoi_candidates += visible.len();
-            let visibility = self.replication.set_visibility(client, visible);
-            let network_lod =
-                self.network_lod_for_client(client, &visibility.visible, &mut selector);
-            let selection = self.replication.select_for_client_with_lod(
+            if !self.aoi.query_observer_into(client, &mut visible_entities) {
+                continue;
+            }
+            metrics.aoi_candidates += visible_entities.len();
+            let visibility = self
+                .replication
+                .set_visibility(client, visible_entities.drain(..));
+            let Some(client_state) = self.clients.get(&client) else {
+                continue;
+            };
+            let client_position = client_state.position;
+            let interest_radius = client_state.interest_radius;
+            let network_lod_policy = self.config.network_lod;
+            let entities = &self.entities;
+            let selection = self.replication.select_for_client_with_lod_context(
                 client,
                 ByteBudget::new(self.config.per_client_byte_budget),
-                |entity, default_lod| network_lod.get(&entity).copied().unwrap_or(default_lod),
+                |context| {
+                    let Some(entity) = entities.get(&context.entity) else {
+                        return context.default_lod;
+                    };
+                    let distance_squared = client_position.distance_squared(entity.position);
+                    let policy_lod = network_lod_policy.lod_for_distance_squared_with_previous(
+                        distance_squared,
+                        interest_radius,
+                        context.last_sent_lod,
+                    );
+                    let lod = selector(NetworkLodContext {
+                        client,
+                        entity: context.entity,
+                        client_position,
+                        entity_position: entity.position,
+                        interest_radius,
+                        distance_squared,
+                        entity_lod_cap: context.default_lod,
+                        previous_lod: context.last_sent_lod,
+                        policy_lod,
+                    });
+                    cap_network_lod(context.default_lod, lod)
+                },
             );
 
             metrics.selected_updates += selection.updates.len();
@@ -1273,48 +1332,6 @@ impl ServerRuntime {
             }
         }
         frame
-    }
-
-    fn network_lod_for_client(
-        &self,
-        client: ClientId,
-        visible_entities: &[EntityId],
-        selector: &mut impl FnMut(NetworkLodContext) -> NetworkLod,
-    ) -> HashMap<EntityId, NetworkLod> {
-        let Some(client) = self.clients.get(&client) else {
-            return HashMap::new();
-        };
-        let mut lod_by_entity = HashMap::with_capacity(visible_entities.len());
-
-        for entity_id in visible_entities {
-            let Some(entity) = self.entities.get(entity_id) else {
-                continue;
-            };
-            let distance_squared = client.position.distance_squared(entity.position);
-            let previous_lod = self.replication.last_sent_lod(client.id, *entity_id);
-            let policy_lod = self
-                .config
-                .network_lod
-                .lod_for_distance_squared_with_previous(
-                    distance_squared,
-                    client.interest_radius,
-                    previous_lod,
-                );
-            let lod = selector(NetworkLodContext {
-                client: client.id,
-                entity: *entity_id,
-                client_position: client.position,
-                entity_position: entity.position,
-                interest_radius: client.interest_radius,
-                distance_squared,
-                entity_lod_cap: entity.lod,
-                previous_lod,
-                policy_lod,
-            });
-            lod_by_entity.insert(*entity_id, cap_network_lod(entity.lod, lod));
-        }
-
-        lod_by_entity
     }
 
     fn record_lag_history(&mut self, tick: Tick) {
