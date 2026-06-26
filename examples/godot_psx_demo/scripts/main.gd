@@ -9,6 +9,9 @@ const GridwakeProtocol := preload("res://scripts/gridwake_protocol.gd")
 @export var turn_speed := 2.4
 @export var max_visual_entities := 6000
 @export var max_packets_per_frame := 32
+@export var perf_sample_hz := 4.0
+@export var perf_log_hz := 1.0
+@export var perf_log_enabled := true
 
 var udp := PacketPeerUDP.new()
 var entity_nodes: Dictionary = {}
@@ -21,9 +24,34 @@ var input_accumulator := 0.0
 var snapshot_sequence := -1
 var packets_received := 0
 var packets_backlogged := 0
+var udp_packets_received := 0
+var udp_packets_last_frame := 0
 var ops_received := 0
+var fragments_received := 0
+var fragments_completed := 0
 var last_server_error := ""
 var snapshot_fragments: Dictionary = {}
+var perf_sample_accumulator := 0.0
+var perf_log_accumulator := 0.0
+var perf_last_sample_msec := 0
+var perf_last_udp_packets := 0
+var perf_last_snapshots := 0
+var perf_last_ops := 0
+var perf_last_fragments := 0
+var perf_fps := 0.0
+var perf_frame_ms := 0.0
+var perf_process_ms := 0.0
+var perf_physics_ms := 0.0
+var perf_draw_calls := 0
+var perf_render_objects := 0
+var perf_render_primitives := 0
+var perf_node_count := 0
+var perf_resource_count := 0
+var perf_static_memory_mb := 0.0
+var perf_udp_packets_per_sec := 0.0
+var perf_snapshots_per_sec := 0.0
+var perf_ops_per_sec := 0.0
+var perf_fragments_per_sec := 0.0
 
 var bot_mesh: BoxMesh
 var player_mesh: BoxMesh
@@ -40,6 +68,8 @@ func _ready() -> void:
 	_setup_rendering()
 	_setup_world()
 	_setup_udp()
+	perf_last_sample_msec = Time.get_ticks_msec()
+	_sample_perf()
 	_send_input()
 
 
@@ -50,6 +80,7 @@ func _exit_tree() -> void:
 func _physics_process(delta: float) -> void:
 	_update_player(delta)
 	_poll_network()
+	_update_perf(delta)
 	input_accumulator += delta
 	if input_accumulator >= 1.0 / input_send_hz:
 		input_accumulator = 0.0
@@ -206,6 +237,8 @@ func _poll_network() -> void:
 			"invalid":
 				last_server_error = decoded.get("reason", "invalid packet")
 	packets_backlogged = udp.get_available_packet_count()
+	udp_packets_last_frame = packets_processed
+	udp_packets_received += packets_processed
 
 
 func _apply_snapshot(snapshot: Dictionary) -> void:
@@ -227,6 +260,7 @@ func _apply_snapshot(snapshot: Dictionary) -> void:
 
 
 func _apply_snapshot_fragment(fragment: Dictionary) -> void:
+	fragments_received += 1
 	var sequence := int(fragment["sequence"])
 	var fragment_index := int(fragment["fragment_index"])
 	var fragment_count := int(fragment["fragment_count"])
@@ -264,6 +298,7 @@ func _apply_snapshot_fragment(fragment: Dictionary) -> void:
 	if int(state["received"]) < fragment_count:
 		return
 
+	fragments_completed += 1
 	var ops: Array[Dictionary] = []
 	for index in range(fragment_count):
 		if not parts.has(index):
@@ -555,6 +590,71 @@ func _fire_pressed() -> bool:
 	return Input.is_key_pressed(KEY_SPACE) or Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)
 
 
+func _update_perf(delta: float) -> void:
+	perf_sample_accumulator += delta
+	perf_log_accumulator += delta
+	var sample_interval: float = 1.0 / max(perf_sample_hz, 0.1)
+	if perf_sample_accumulator >= sample_interval:
+		perf_sample_accumulator = 0.0
+		_sample_perf()
+	var log_interval: float = 1.0 / max(perf_log_hz, 0.1)
+	if perf_log_enabled and perf_log_accumulator >= log_interval:
+		perf_log_accumulator = 0.0
+		_log_perf()
+
+
+func _sample_perf() -> void:
+	var now_msec: int = Time.get_ticks_msec()
+	var elapsed_seconds: float = max(float(now_msec - perf_last_sample_msec) / 1000.0, 0.001)
+	perf_fps = float(Performance.get_monitor(Performance.TIME_FPS))
+	if perf_fps > 0.0:
+		perf_frame_ms = 1000.0 / perf_fps
+	else:
+		perf_frame_ms = 0.0
+	perf_process_ms = float(Performance.get_monitor(Performance.TIME_PROCESS)) * 1000.0
+	perf_physics_ms = float(Performance.get_monitor(Performance.TIME_PHYSICS_PROCESS)) * 1000.0
+	perf_draw_calls = int(Performance.get_monitor(Performance.RENDER_TOTAL_DRAW_CALLS_IN_FRAME))
+	perf_render_objects = int(Performance.get_monitor(Performance.RENDER_TOTAL_OBJECTS_IN_FRAME))
+	perf_render_primitives = int(Performance.get_monitor(Performance.RENDER_TOTAL_PRIMITIVES_IN_FRAME))
+	perf_node_count = int(Performance.get_monitor(Performance.OBJECT_NODE_COUNT))
+	perf_resource_count = int(Performance.get_monitor(Performance.OBJECT_RESOURCE_COUNT))
+	perf_static_memory_mb = float(Performance.get_monitor(Performance.MEMORY_STATIC)) / (1024.0 * 1024.0)
+	perf_udp_packets_per_sec = float(udp_packets_received - perf_last_udp_packets) / elapsed_seconds
+	perf_snapshots_per_sec = float(packets_received - perf_last_snapshots) / elapsed_seconds
+	perf_ops_per_sec = float(ops_received - perf_last_ops) / elapsed_seconds
+	perf_fragments_per_sec = float(fragments_received - perf_last_fragments) / elapsed_seconds
+	perf_last_sample_msec = now_msec
+	perf_last_udp_packets = udp_packets_received
+	perf_last_snapshots = packets_received
+	perf_last_ops = ops_received
+	perf_last_fragments = fragments_received
+
+
+func _log_perf() -> void:
+	print(
+		"perf fps=%.1f frame_ms=%.2f process_ms=%.2f physics_ms=%.2f visible=%d instanced=%d buckets=%d nodes=%d draw_calls=%d render_objects=%d primitives=%d udp_pps=%.1f snapshots_ps=%.1f ops_ps=%.1f fragments_ps=%.1f backlog=%d pending_fragments=%d memory_mb=%.1f" % [
+			perf_fps,
+			perf_frame_ms,
+			perf_process_ms,
+			perf_physics_ms,
+			_visible_entity_count(),
+			instanced_entity_slots.size(),
+			instanced_buckets.size(),
+			perf_node_count,
+			perf_draw_calls,
+			perf_render_objects,
+			perf_render_primitives,
+			perf_udp_packets_per_sec,
+			perf_snapshots_per_sec,
+			perf_ops_per_sec,
+			perf_fragments_per_sec,
+			packets_backlogged,
+			snapshot_fragments.size(),
+			perf_static_memory_mb,
+		]
+	)
+
+
 func _update_camera() -> void:
 	var forward := Vector3(sin(player_yaw), 0.0, cos(player_yaw))
 	camera.position = player_position - forward * 18.0 + Vector3(0.0, 13.0, 0.0)
@@ -562,21 +662,35 @@ func _update_camera() -> void:
 
 
 func _update_hud() -> void:
-	hud.text = "Gridwake Godot Demo\nserver %s:%d\nvisible %d / cap %d\ninstanced %d buckets %d nodes %d\ncover %d damaged %d ruined %d\nsnapshot %d packets %d backlog %d fragments %d ops %d\n%s" % [
+	hud.text = "Gridwake Godot Demo\nserver %s:%d\nfps %.1f frame %.2fms proc %.2fms phys %.2fms\nvisible %d / cap %d instanced %d buckets %d nodes %d resources %d\nrender draw %d objects %d prim %d mem %.1fMB\ncover %d damaged %d ruined %d\nsnapshot %d udp %d last %d %.1f/s backlog %d fragments %d pending %d %.1f/s ops %d %.1f/s\n%s" % [
 		server_host,
 		server_port,
+		perf_fps,
+		perf_frame_ms,
+		perf_process_ms,
+		perf_physics_ms,
 		_visible_entity_count(),
 		max_visual_entities,
 		instanced_entity_slots.size(),
 		instanced_buckets.size(),
-		entity_nodes.size(),
+		perf_node_count,
+		perf_resource_count,
+		perf_draw_calls,
+		perf_render_objects,
+		perf_render_primitives,
+		perf_static_memory_mb,
 		cover_nodes.size(),
 		damaged_cover_nodes.size(),
 		ruined_cover_nodes.size(),
 		snapshot_sequence,
-		packets_received,
+		udp_packets_received,
+		udp_packets_last_frame,
+		perf_udp_packets_per_sec,
 		packets_backlogged,
+		fragments_received,
 		snapshot_fragments.size(),
+		perf_fragments_per_sec,
 		ops_received,
+		perf_ops_per_sec,
 		last_server_error,
 	]
