@@ -68,6 +68,12 @@ var cover_nodes: Dictionary = {}
 var damaged_cover_nodes: Dictionary = {}
 var ruined_cover_nodes: Dictionary = {}
 var impact_nodes: Dictionary = {}
+var score_nodes: Dictionary = {}
+var local_player_entity := -1
+var local_player_team := -1
+var local_player_health := 1.0
+var red_score := 0
+var blue_score := 0
 
 func _ready() -> void:
 	_setup_rendering()
@@ -151,12 +157,18 @@ func _setup_world() -> void:
 
 
 func _create_materials() -> void:
-	materials["bot_0"] = _material(Color(0.95, 0.25, 0.32))
-	materials["bot_1"] = _material(Color(0.23, 0.62, 1.0))
-	materials["bot_2"] = _material(Color(0.95, 0.82, 0.22))
-	materials["player"] = _material(Color(0.75, 1.0, 0.72))
-	materials["effect"] = _material(Color(0.98, 0.42, 0.92))
+	materials["bot_red"] = _material(Color(0.95, 0.18, 0.22))
+	materials["bot_red_hurt"] = _material(Color(0.58, 0.10, 0.12))
+	materials["bot_blue"] = _material(Color(0.18, 0.50, 1.0))
+	materials["bot_blue_hurt"] = _material(Color(0.10, 0.23, 0.58))
+	materials["player_red"] = _material(Color(1.0, 0.46, 0.42))
+	materials["player_blue"] = _material(Color(0.42, 0.72, 1.0))
+	materials["player_down"] = _material(Color(0.16, 0.16, 0.18))
+	materials["effect_red"] = _material(Color(1.0, 0.35, 0.42))
+	materials["effect_blue"] = _material(Color(0.30, 0.62, 1.0))
 	materials["impact"] = _material(Color(1.0, 0.74, 0.30))
+	materials["score_red"] = _material(Color(1.0, 0.10, 0.08))
+	materials["score_blue"] = _material(Color(0.10, 0.42, 1.0))
 	materials["minimal"] = _material(Color(0.52, 0.57, 0.66))
 	materials["cover_0"] = _material(Color(0.43, 0.48, 0.50))
 	materials["cover_1"] = _material(Color(0.50, 0.41, 0.34))
@@ -272,6 +284,9 @@ func _setup_udp() -> void:
 
 
 func _update_player(delta: float) -> void:
+	if local_player_entity != -1 and local_player_health <= 0.0:
+		return
+
 	var turn := 0.0
 	if Input.is_key_pressed(KEY_LEFT) or Input.is_key_pressed(KEY_A):
 		turn += 1.0
@@ -401,6 +416,7 @@ func _forget_fragment_sequence(key: String) -> void:
 
 
 func _upsert_entity(entity: int, payload: Dictionary) -> void:
+	_update_match_state(entity, payload)
 	if int(payload["kind"]) == GridwakeProtocol.KIND_PLAYER:
 		_upsert_player_node(entity, payload)
 	else:
@@ -426,8 +442,17 @@ func _upsert_player_node(entity: int, payload: Dictionary) -> void:
 	node.rotation.y = payload["yaw"]
 	var radius := float(payload["radius"])
 	var lod := int(payload["lod"])
-	node.scale = Vector3.ONE * (radius * _lod_scale(lod))
+	var health := _combat_health(payload)
+	var height_scale: float = 0.35 if health <= 0.0 else 1.0
+	node.scale = Vector3(radius * _lod_scale(lod), radius * _lod_scale(lod) * height_scale, radius * _lod_scale(lod))
 	_apply_material(entity, node, payload)
+
+	if local_player_entity == -1:
+		local_player_entity = entity
+	if local_player_entity == entity:
+		player_position = payload["position"]
+		local_player_team = int(payload["team"])
+		local_player_health = health
 
 
 func _upsert_instanced_entity(entity: int, payload: Dictionary) -> void:
@@ -456,6 +481,8 @@ func _upsert_instanced_entity(entity: int, payload: Dictionary) -> void:
 		_update_cover_counters(entity, payload)
 	elif int(payload["kind"]) == GridwakeProtocol.KIND_IMPACT:
 		impact_nodes[entity] = true
+	elif int(payload["kind"]) == GridwakeProtocol.KIND_SCOREBOARD:
+		score_nodes[entity] = true
 
 
 func _transform_for_payload(payload: Dictionary) -> Transform3D:
@@ -463,11 +490,15 @@ func _transform_for_payload(payload: Dictionary) -> Transform3D:
 		return _cover_transform_for_payload(payload)
 	if int(payload["kind"]) == GridwakeProtocol.KIND_IMPACT:
 		return _impact_transform_for_payload(payload)
+	if int(payload["kind"]) == GridwakeProtocol.KIND_SCOREBOARD:
+		return _scoreboard_transform_for_payload(payload)
 
 	var position: Vector3 = payload["position"]
 	var radius := float(payload["radius"])
 	var lod := int(payload["lod"])
-	var scale := Vector3.ONE * (radius * _lod_scale(lod))
+	var health := _combat_health(payload)
+	var height_scale: float = 0.3 if health <= 0.0 else max(0.45, health)
+	var scale := Vector3(radius * _lod_scale(lod), radius * _lod_scale(lod) * height_scale, radius * _lod_scale(lod))
 	var basis := Basis(Vector3.UP, float(payload["yaw"]))
 	basis = basis.scaled(scale)
 	return Transform3D(basis, position)
@@ -489,6 +520,25 @@ func _impact_transform_for_payload(payload: Dictionary) -> Transform3D:
 	var pulse := radius * (0.35 + phase * 1.35)
 	var basis := Basis.IDENTITY.scaled(Vector3.ONE * pulse)
 	return Transform3D(basis, Vector3(position.x, 0.25 + phase * 0.8, position.z))
+
+
+func _scoreboard_transform_for_payload(payload: Dictionary) -> Transform3D:
+	var position: Vector3 = payload["position"]
+	var score: float = float(payload["phase"])
+	var height: float = 5.5 + min(score * 0.18, 9.0)
+	var basis := Basis.IDENTITY.scaled(Vector3(3.2, height, 3.2))
+	return Transform3D(basis, Vector3(position.x, height * 0.5, position.z))
+
+
+func _update_match_state(entity: int, payload: Dictionary) -> void:
+	var kind := int(payload["kind"])
+	if (kind == GridwakeProtocol.KIND_PLAYER or kind == GridwakeProtocol.KIND_SCOREBOARD) and int(payload["lod"]) == GridwakeProtocol.LOD_FULL:
+		var packed_scores := int(payload["style"])
+		red_score = packed_scores & 0x0fff
+		blue_score = (packed_scores >> 12) & 0x0fff
+	if local_player_entity == entity and kind == GridwakeProtocol.KIND_PLAYER:
+		local_player_team = int(payload["team"])
+		local_player_health = _combat_health(payload)
 
 
 func _update_cover_counters(entity: int, payload: Dictionary) -> void:
@@ -516,6 +566,7 @@ func _remove_entity(entity: int) -> void:
 	damaged_cover_nodes.erase(entity)
 	ruined_cover_nodes.erase(entity)
 	impact_nodes.erase(entity)
+	score_nodes.erase(entity)
 
 
 func _add_instanced_entity(entity: int, bucket_key: String, transform: Transform3D) -> void:
@@ -627,6 +678,8 @@ func _mesh_key_for_payload(payload: Dictionary) -> String:
 			return "cover"
 		GridwakeProtocol.KIND_IMPACT:
 			return "impact"
+		GridwakeProtocol.KIND_SCOREBOARD:
+			return "scoreboard"
 		_:
 			return "bot"
 
@@ -639,6 +692,8 @@ func _mesh_for_key(mesh_key: String) -> Mesh:
 			return cover_mesh
 		"impact":
 			return impact_mesh
+		"scoreboard":
+			return cover_mesh
 		_:
 			return bot_mesh
 
@@ -658,13 +713,17 @@ func _apply_material(entity: int, node: MeshInstance3D, payload: Dictionary) -> 
 func _material_key_for_payload(payload: Dictionary) -> String:
 	if int(payload["kind"]) == GridwakeProtocol.KIND_IMPACT:
 		return "impact"
+	if int(payload["kind"]) == GridwakeProtocol.KIND_SCOREBOARD:
+		return "score_red" if int(payload["team"]) == GridwakeProtocol.TEAM_RED else "score_blue"
 	if int(payload["lod"]) == GridwakeProtocol.LOD_MINIMAL:
 		return "minimal"
 	match int(payload["kind"]):
 		GridwakeProtocol.KIND_PLAYER:
-			return "player"
+			if _combat_health(payload) <= 0.0:
+				return "player_down"
+			return "player_red" if int(payload["team"]) == GridwakeProtocol.TEAM_RED else "player_blue"
 		GridwakeProtocol.KIND_EFFECT:
-			return "effect"
+			return "effect_red" if int(payload["team"]) == GridwakeProtocol.TEAM_RED else "effect_blue"
 		GridwakeProtocol.KIND_COVER:
 			var health := _cover_health(payload)
 			if health <= 0.05:
@@ -673,7 +732,10 @@ func _material_key_for_payload(payload: Dictionary) -> String:
 				return "cover_damaged"
 			return "cover_%d" % int(payload["team"] % 4)
 		_:
-			return "bot_%d" % int(payload["team"] % 3)
+			var health := _combat_health(payload)
+			if int(payload["team"]) == GridwakeProtocol.TEAM_RED:
+				return "bot_red_hurt" if health < 0.45 else "bot_red"
+			return "bot_blue_hurt" if health < 0.45 else "bot_blue"
 
 
 func _lod_scale(lod: int) -> float:
@@ -688,6 +750,12 @@ func _lod_scale(lod: int) -> float:
 
 func _cover_health(payload: Dictionary) -> float:
 	return clampf(float(payload["yaw"]), 0.0, 1.0)
+
+
+func _combat_health(payload: Dictionary) -> float:
+	if int(payload["lod"]) != GridwakeProtocol.LOD_FULL:
+		return 1.0
+	return clampf(float(payload["phase"]), 0.0, 1.0)
 
 
 func _send_input() -> void:
@@ -770,7 +838,13 @@ func _update_camera() -> void:
 
 
 func _update_hud() -> void:
-	hud.text = "Gridwake Godot Demo\nserver %s:%d\nfps %.1f frame %.2fms proc %.2fms phys %.2fms\nvisible %d / cap %d instanced %d buckets %d nodes %d resources %d\nrender draw %d objects %d prim %d mem %.1fMB\ncover %d damaged %d ruined %d impacts %d\nsnapshot %d udp %d last %d %.1f/s backlog %d fragments %d pending %d %.1f/s ops %d %.1f/s\n%s" % [
+	var status := "ALIVE" if local_player_health > 0.0 else "RESPAWNING"
+	hud.text = "Gridwake Deathmatch\nRED %d  BLUE %d\nteam %s health %d%% %s\nserver %s:%d\nfps %.1f frame %.2fms proc %.2fms phys %.2fms\nvisible %d / cap %d instanced %d buckets %d nodes %d resources %d\nrender draw %d objects %d prim %d mem %.1fMB\ncover %d damaged %d ruined %d impacts %d score_nodes %d\nsnapshot %d udp %d last %d %.1f/s backlog %d fragments %d pending %d %.1f/s ops %d %.1f/s\n%s" % [
+		red_score,
+		blue_score,
+		_team_name(local_player_team),
+		int(round(local_player_health * 100.0)),
+		status,
 		server_host,
 		server_port,
 		perf_fps,
@@ -791,6 +865,7 @@ func _update_hud() -> void:
 		damaged_cover_nodes.size(),
 		ruined_cover_nodes.size(),
 		impact_nodes.size(),
+		score_nodes.size(),
 		snapshot_sequence,
 		udp_packets_received,
 		udp_packets_last_frame,
@@ -803,3 +878,13 @@ func _update_hud() -> void:
 		perf_ops_per_sec,
 		last_server_error,
 	]
+
+
+func _team_name(team: int) -> String:
+	match team:
+		GridwakeProtocol.TEAM_RED:
+			return "RED"
+		GridwakeProtocol.TEAM_BLUE:
+			return "BLUE"
+		_:
+			return "JOINING"

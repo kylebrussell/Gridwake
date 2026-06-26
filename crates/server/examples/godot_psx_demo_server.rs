@@ -22,6 +22,11 @@ const KIND_PLAYER: u8 = 1;
 const KIND_EFFECT: u8 = 2;
 const KIND_COVER: u8 = 3;
 const KIND_IMPACT: u8 = 4;
+const KIND_SCOREBOARD: u8 = 5;
+
+const TEAM_RED: u8 = 0;
+const TEAM_BLUE: u8 = 1;
+const TEAM_COUNT: usize = 2;
 
 const LOD_FULL: u8 = 0;
 const LOD_REDUCED: u8 = 1;
@@ -44,6 +49,17 @@ const COVER_INDEX_CELL_SIZE: f32 = 16.0;
 const IMPACT_LIFETIME_TICKS: u64 = 18;
 const MAX_ACTIVE_IMPACTS: usize = 512;
 const MAX_PORTABLE_UDP_PAYLOAD_BYTES: usize = 8_192;
+const BOT_MAX_HEALTH: f32 = 100.0;
+const PLAYER_MAX_HEALTH: f32 = 125.0;
+const PLAYER_WEAPON_RANGE: f32 = 42.0;
+const PLAYER_WEAPON_RADIUS: f32 = 7.5;
+const PLAYER_WEAPON_DAMAGE: f32 = 65.0;
+const BOT_WEAPON_RANGE: f32 = 28.0;
+const BOT_WEAPON_DAMAGE: f32 = 18.0;
+const BOT_FIRE_INTERVAL_TICKS: u64 = 18;
+const BOT_RESPAWN_TICKS: u64 = 70;
+const PLAYER_RESPAWN_TICKS: u64 = 55;
+const SCORE_ENTITY_BASE: u64 = 8_000_000;
 
 #[derive(Clone, Debug)]
 struct Args {
@@ -89,9 +105,27 @@ struct DemoEntity {
     phase: f32,
     radius: f32,
     style: u32,
+    health: f32,
+    respawn_tick: u64,
 }
 
 impl DemoEntity {
+    fn is_combatant(&self) -> bool {
+        self.kind == KIND_BOT
+    }
+
+    fn is_alive(&self) -> bool {
+        !self.is_combatant() || self.health > 0.0
+    }
+
+    fn health_ratio(&self) -> f32 {
+        if self.is_combatant() {
+            (self.health / BOT_MAX_HEALTH).clamp(0.0, 1.0)
+        } else {
+            1.0
+        }
+    }
+
     fn position_at(&self, seconds: f32) -> Vec3 {
         let angle = self.phase + seconds * self.speed;
         match self.kind {
@@ -118,13 +152,18 @@ impl DemoEntity {
     }
 
     fn payloads_at_position(&self, seconds: f32, position: Vec3) -> NetworkLodPayloads {
+        let phase = if self.is_combatant() {
+            self.health_ratio()
+        } else {
+            seconds + self.phase
+        };
         payloads_for_entity(
             self.kind,
             self.team,
             position,
             self.yaw_at(seconds),
             self.radius,
-            seconds + self.phase,
+            phase,
             self.style,
         )
     }
@@ -295,9 +334,53 @@ impl DemoImpact {
 #[derive(Clone, Debug)]
 struct ClientState {
     player_entity: EntityId,
+    team: u8,
     position: Vec3,
     yaw: f32,
+    health: f32,
     next_fire_tick: u64,
+    respawn_tick: u64,
+}
+
+impl ClientState {
+    fn is_alive(&self) -> bool {
+        self.health > 0.0
+    }
+
+    fn health_ratio(&self) -> f32 {
+        (self.health / PLAYER_MAX_HEALTH).clamp(0.0, 1.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DeathmatchState {
+    team_scores: [u32; TEAM_COUNT],
+}
+
+impl DeathmatchState {
+    fn add_score(&mut self, team: u8) {
+        if let Some(score) = self.team_scores.get_mut(team as usize) {
+            *score = score.saturating_add(1);
+        }
+    }
+
+    fn packed_scores(self) -> u32 {
+        (self.team_scores[TEAM_RED as usize].min(0x0fff))
+            | (self.team_scores[TEAM_BLUE as usize].min(0x0fff) << 12)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CombatTarget {
+    Bot(usize),
+    Client(ClientId),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DamageEvent {
+    attacker_team: u8,
+    target: CombatTarget,
+    damage: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -623,6 +706,8 @@ fn main() -> io::Result<()> {
     let mut impacts = VecDeque::new();
     let mut next_impact_id = 0_u64;
     let mut clients = HashMap::new();
+    let mut match_state = DeathmatchState::default();
+    spawn_score_entities(&mut runtime, &args, match_state);
     let mut perf_totals = PerfTotals::default();
 
     println!(
@@ -646,6 +731,7 @@ fn main() -> io::Result<()> {
     let mut tick_count = 0_u64;
 
     loop {
+        let inbound_seconds = started.elapsed().as_secs_f32();
         {
             let mut world = WorldInteractionState {
                 covers: &mut covers,
@@ -654,11 +740,17 @@ fn main() -> io::Result<()> {
                 impacts: &mut impacts,
                 next_impact_id: &mut next_impact_id,
             };
+            let mut deathmatch = DeathmatchWorldState {
+                entities: &mut demo_entities,
+                match_state: &mut match_state,
+            };
             handle_inbound(
                 &mut runtime,
                 &mut transport,
                 &mut clients,
                 &mut world,
+                &mut deathmatch,
+                inbound_seconds,
                 tick_count,
             );
         }
@@ -669,7 +761,23 @@ fn main() -> io::Result<()> {
             tick_count = tick_count.saturating_add(1);
             let seconds = started.elapsed().as_secs_f32();
             let update_started = Instant::now();
-            update_demo_entities(&mut runtime, &mut demo_entities, seconds);
+            let combat_events = update_demo_entities(
+                &mut runtime,
+                &mut demo_entities,
+                &clients,
+                seconds,
+                tick_count,
+            );
+            let combat_stats = apply_damage_events(
+                &mut runtime,
+                &mut demo_entities,
+                &mut clients,
+                &mut match_state,
+                combat_events,
+                tick_count,
+            );
+            update_client_payloads(&mut runtime, &mut clients, match_state, tick_count);
+            update_score_entities(&mut runtime, &args, match_state);
             let update_micros = update_started.elapsed().as_micros();
             let world_started = Instant::now();
             let world_events = {
@@ -703,7 +811,7 @@ fn main() -> io::Result<()> {
 
             if metrics.tick.raw() % args.log_every_ticks == 0 {
                 println!(
-                    "tick={} clients={} entities={} aoi={} selected={} lod={}/{}/{} deferred={} bytes={} messages={} cover_hits={} cover_destroyed={} impacts={} active_impacts={} ms={:.3}/{:.3}/{:.3}/{:.3} datagrams={} net_bytes={} fragments={} send_errors={}",
+                    "tick={} clients={} entities={} aoi={} selected={} lod={}/{}/{} deferred={} bytes={} messages={} score={}:{} kills={} combat_hits={} cover_hits={} cover_destroyed={} impacts={} active_impacts={} ms={:.3}/{:.3}/{:.3}/{:.3} datagrams={} net_bytes={} fragments={} send_errors={}",
                     metrics.tick.raw(),
                     metrics.clients,
                     metrics.entities,
@@ -715,6 +823,10 @@ fn main() -> io::Result<()> {
                     metrics.deferred_updates,
                     metrics.bytes_scheduled,
                     metrics.messages_sent,
+                    match_state.team_scores[TEAM_RED as usize],
+                    match_state.team_scores[TEAM_BLUE as usize],
+                    combat_stats.kills,
+                    combat_stats.combat_hits,
                     world_events.cover_hits,
                     world_events.cover_destroyed,
                     world_events.impacts_spawned,
@@ -768,6 +880,12 @@ struct WorldEventStats {
     impacts_spawned: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct CombatStats {
+    combat_hits: usize,
+    kills: usize,
+}
+
 struct WorldInteractionState<'a> {
     covers: &'a mut [DemoCover],
     cover_index: &'a CoverIndex,
@@ -776,16 +894,29 @@ struct WorldInteractionState<'a> {
     next_impact_id: &'a mut u64,
 }
 
+struct DeathmatchWorldState<'a> {
+    entities: &'a mut [DemoEntity],
+    match_state: &'a mut DeathmatchState,
+}
+
+struct CombatWriteState<'a> {
+    entities: &'a mut [DemoEntity],
+    clients: &'a mut HashMap<ClientId, ClientState>,
+    match_state: &'a mut DeathmatchState,
+}
+
 fn handle_inbound(
     runtime: &mut ServerRuntime,
     transport: &mut DemoUdpTransport,
     clients: &mut HashMap<ClientId, ClientState>,
     world: &mut WorldInteractionState<'_>,
+    deathmatch: &mut DeathmatchWorldState<'_>,
+    seconds: f32,
     tick: u64,
 ) {
     for inbound in transport.drain_client_messages() {
         if inbound.newly_connected {
-            connect_demo_client(runtime, clients, inbound.client);
+            connect_demo_client(runtime, clients, inbound.client, *deathmatch.match_state);
         }
 
         match inbound.message {
@@ -794,44 +925,64 @@ fn handle_inbound(
             }
             ClientMessage::Input { payload } => {
                 if let Some(input) = parse_client_input(&payload) {
+                    let mut fire_event = None;
                     if let Some(client) = clients.get_mut(&inbound.client) {
+                        if !client.is_alive() {
+                            if tick >= client.respawn_tick {
+                                respawn_client(
+                                    runtime,
+                                    inbound.client,
+                                    client,
+                                    *deathmatch.match_state,
+                                );
+                                continue;
+                            } else {
+                                continue;
+                            }
+                        }
                         client.position = input.position;
                         client.yaw = input.yaw;
                         runtime.update_client_position(inbound.client, input.position);
                         runtime.move_entity(client.player_entity, input.position);
-                        runtime.set_entity_lod_payloads(
-                            client.player_entity,
-                            player_payload(LOD_FULL, input.position, input.yaw),
-                            player_payload(LOD_REDUCED, input.position, input.yaw),
-                            player_payload(LOD_MINIMAL, input.position, input.yaw),
-                        );
+                        set_player_payload(runtime, client, *deathmatch.match_state);
                         if input.fire && tick >= client.next_fire_tick {
                             let forward = Vec3::new(input.yaw.sin(), 0.0, input.yaw.cos());
                             let blast = Vec3::new(
-                                input.position.x + forward.x * 18.0,
+                                input.position.x + forward.x * PLAYER_WEAPON_RANGE * 0.65,
                                 0.0,
-                                input.position.z + forward.z * 18.0,
+                                input.position.z + forward.z * PLAYER_WEAPON_RANGE * 0.65,
                             );
-                            let impact_events = damage_covers(
-                                runtime,
-                                &mut *world.covers,
-                                world.cover_index,
-                                &mut *world.cover_candidates,
-                                blast,
-                                PLAYER_BLAST_RADIUS,
-                                PLAYER_BLAST_DAMAGE,
-                            );
-                            spawn_impact(
-                                runtime,
-                                &mut *world.impacts,
-                                &mut *world.next_impact_id,
-                                blast,
-                                PLAYER_BLAST_RADIUS,
-                                11 + impact_events.cover_hits as u32,
-                                tick,
-                            );
+                            fire_event = Some((client.team, blast));
                             client.next_fire_tick = tick.saturating_add(PLAYER_FIRE_COOLDOWN_TICKS);
                         }
+                    }
+
+                    if let Some((attacker_team, blast)) = fire_event {
+                        let mut combat = CombatWriteState {
+                            entities: &mut *deathmatch.entities,
+                            clients,
+                            match_state: &mut *deathmatch.match_state,
+                        };
+                        let stats =
+                            player_fire(runtime, &mut combat, attacker_team, blast, seconds, tick);
+                        let impact_events = damage_covers(
+                            runtime,
+                            &mut *world.covers,
+                            world.cover_index,
+                            &mut *world.cover_candidates,
+                            blast,
+                            PLAYER_BLAST_RADIUS,
+                            PLAYER_BLAST_DAMAGE,
+                        );
+                        spawn_impact(
+                            runtime,
+                            &mut *world.impacts,
+                            &mut *world.next_impact_id,
+                            blast,
+                            PLAYER_WEAPON_RADIUS.max(PLAYER_BLAST_RADIUS * 0.5),
+                            11 + impact_events.cover_hits as u32 + stats.kills as u32,
+                            tick,
+                        );
                     }
                 }
             }
@@ -843,35 +994,121 @@ fn connect_demo_client(
     runtime: &mut ServerRuntime,
     clients: &mut HashMap<ClientId, ClientState>,
     client: ClientId,
+    match_state: DeathmatchState,
 ) {
     if clients.contains_key(&client) {
         return;
     }
 
-    let spawn = player_spawn(client);
+    let team = team_for_client(client);
+    let spawn = player_spawn(client, team);
     let player_entity = EntityId::new(PLAYER_ENTITY_BASE + client.raw());
     runtime.connect_client(client, spawn, None);
+    let state = ClientState {
+        player_entity,
+        team,
+        position: spawn,
+        yaw: 0.0,
+        health: PLAYER_MAX_HEALTH,
+        next_fire_tick: 0,
+        respawn_tick: 0,
+    };
     runtime.spawn_entity_with_lod_payloads(
         player_entity,
         spawn,
-        payloads_for_entity(KIND_PLAYER, 3, spawn, 0.0, 1.2, 0.0, 0),
+        player_payloads(&state, match_state),
         10.0,
         NetworkLod::Full,
     );
-    clients.insert(
-        client,
-        ClientState {
-            player_entity,
-            position: spawn,
-            yaw: 0.0,
-            next_fire_tick: 0,
-        },
-    );
+    clients.insert(client, state);
     println!(
-        "client {} connected as entity {}",
+        "client {} connected as entity {} team={}",
         client.raw(),
-        player_entity.raw()
+        player_entity.raw(),
+        team_name(team)
     );
+}
+
+fn respawn_client(
+    runtime: &mut ServerRuntime,
+    client_id: ClientId,
+    client: &mut ClientState,
+    match_state: DeathmatchState,
+) {
+    let spawn = player_spawn(client_id, client.team);
+    client.position = spawn;
+    client.yaw = if client.team == TEAM_RED {
+        0.0
+    } else {
+        std::f32::consts::PI
+    };
+    client.health = PLAYER_MAX_HEALTH;
+    client.respawn_tick = 0;
+    runtime.update_client_position(client_id, spawn);
+    runtime.move_entity(client.player_entity, spawn);
+    set_player_payload(runtime, client, match_state);
+}
+
+fn update_client_payloads(
+    runtime: &mut ServerRuntime,
+    clients: &mut HashMap<ClientId, ClientState>,
+    match_state: DeathmatchState,
+    tick: u64,
+) {
+    for (&client_id, client) in clients.iter_mut() {
+        if !client.is_alive() && tick >= client.respawn_tick {
+            respawn_client(runtime, client_id, client, match_state);
+        }
+        set_player_payload(runtime, client, match_state);
+    }
+}
+
+fn set_player_payload(
+    runtime: &mut ServerRuntime,
+    client: &ClientState,
+    match_state: DeathmatchState,
+) {
+    let payloads = player_payloads(client, match_state);
+    runtime.set_entity_lod_payloads(
+        client.player_entity,
+        payloads.full,
+        payloads.reduced,
+        payloads.minimal,
+    );
+}
+
+fn player_payloads(client: &ClientState, match_state: DeathmatchState) -> NetworkLodPayloads {
+    NetworkLodPayloads::new(
+        player_payload(LOD_FULL, client, match_state),
+        player_payload(LOD_REDUCED, client, match_state),
+        player_payload(LOD_MINIMAL, client, match_state),
+    )
+}
+
+fn spawn_score_entities(runtime: &mut ServerRuntime, args: &Args, match_state: DeathmatchState) {
+    for team in [TEAM_RED, TEAM_BLUE] {
+        let position = team_base_position(team, args.world_size);
+        runtime.spawn_entity_with_lod_payloads(
+            EntityId::new(SCORE_ENTITY_BASE + u64::from(team)),
+            position,
+            score_payloads(team, position, match_state),
+            50.0,
+            NetworkLod::Full,
+        );
+    }
+}
+
+fn update_score_entities(runtime: &mut ServerRuntime, args: &Args, match_state: DeathmatchState) {
+    for team in [TEAM_RED, TEAM_BLUE] {
+        let position = team_base_position(team, args.world_size);
+        let payloads = score_payloads(team, position, match_state);
+        runtime.set_entity_lod_payloads(
+            EntityId::new(SCORE_ENTITY_BASE + u64::from(team)),
+            payloads.full,
+            payloads.reduced,
+            payloads.minimal,
+        );
+    }
 }
 
 fn seed_demo_entities(runtime: &mut ServerRuntime, args: &Args) -> Vec<DemoEntity> {
@@ -949,12 +1186,194 @@ fn seed_demo_covers(runtime: &mut ServerRuntime, args: &Args) -> Vec<DemoCover> 
     covers
 }
 
-fn update_demo_entities(runtime: &mut ServerRuntime, entities: &mut [DemoEntity], seconds: f32) {
-    for entity in entities {
-        let position = entity.position_at(seconds);
-        let payloads = entity.payloads_at_position(seconds, position);
-        runtime.move_entity_with_lod_payloads(entity.entity, position, payloads);
+fn update_demo_entities(
+    runtime: &mut ServerRuntime,
+    entities: &mut [DemoEntity],
+    clients: &HashMap<ClientId, ClientState>,
+    seconds: f32,
+    tick: u64,
+) -> Vec<DamageEvent> {
+    let mut damage_events = Vec::new();
+    let match_active = !clients.is_empty();
+    for index in 0..entities.len() {
+        let mut shooter = None;
+        {
+            let entity = &mut entities[index];
+            if entity.is_combatant() && !entity.is_alive() {
+                if tick >= entity.respawn_tick {
+                    entity.health = BOT_MAX_HEALTH;
+                    let position = entity.position_at(seconds);
+                    runtime.spawn_entity_with_lod_payloads(
+                        entity.entity,
+                        position,
+                        entity.payloads_at_position(seconds, position),
+                        1.0 + f32::from(entity.team) * 0.25,
+                        NetworkLod::Full,
+                    );
+                }
+                continue;
+            }
+
+            let position = entity.position_at(seconds);
+            let payloads = entity.payloads_at_position(seconds, position);
+            runtime.move_entity_with_lod_payloads(entity.entity, position, payloads);
+
+            if match_active
+                && entity.is_combatant()
+                && tick % BOT_FIRE_INTERVAL_TICKS == index as u64 % BOT_FIRE_INTERVAL_TICKS
+            {
+                shooter = Some((entity.team, position));
+            }
+        }
+
+        if let Some((team, position)) = shooter {
+            if let Some(event) = bot_fire_event(index, team, position, entities, clients, seconds) {
+                damage_events.push(event);
+            }
+        }
     }
+    damage_events
+}
+
+fn bot_fire_event(
+    shooter_index: usize,
+    attacker_team: u8,
+    shooter_position: Vec3,
+    entities: &[DemoEntity],
+    clients: &HashMap<ClientId, ClientState>,
+    seconds: f32,
+) -> Option<DamageEvent> {
+    let mut best_target = None;
+    let mut best_distance_squared = BOT_WEAPON_RANGE * BOT_WEAPON_RANGE;
+
+    for (index, entity) in entities.iter().enumerate() {
+        if index == shooter_index
+            || !entity.is_combatant()
+            || !entity.is_alive()
+            || entity.team == attacker_team
+        {
+            continue;
+        }
+        let distance_squared = distance_squared_xz(shooter_position, entity.position_at(seconds));
+        if distance_squared < best_distance_squared {
+            best_distance_squared = distance_squared;
+            best_target = Some(CombatTarget::Bot(index));
+        }
+    }
+
+    for (&client, state) in clients {
+        if !state.is_alive() || state.team == attacker_team {
+            continue;
+        }
+        let distance_squared = distance_squared_xz(shooter_position, state.position);
+        if distance_squared < best_distance_squared {
+            best_distance_squared = distance_squared;
+            best_target = Some(CombatTarget::Client(client));
+        }
+    }
+
+    best_target.map(|target| DamageEvent {
+        attacker_team,
+        target,
+        damage: BOT_WEAPON_DAMAGE,
+    })
+}
+
+fn player_fire(
+    runtime: &mut ServerRuntime,
+    combat: &mut CombatWriteState<'_>,
+    attacker_team: u8,
+    blast: Vec3,
+    seconds: f32,
+    tick: u64,
+) -> CombatStats {
+    let mut events = Vec::new();
+    let radius_squared = PLAYER_WEAPON_RADIUS * PLAYER_WEAPON_RADIUS;
+    for (index, entity) in combat.entities.iter().enumerate() {
+        if !entity.is_combatant() || !entity.is_alive() || entity.team == attacker_team {
+            continue;
+        }
+        if distance_squared_xz(blast, entity.position_at(seconds)) <= radius_squared {
+            events.push(DamageEvent {
+                attacker_team,
+                target: CombatTarget::Bot(index),
+                damage: PLAYER_WEAPON_DAMAGE,
+            });
+        }
+    }
+
+    for (&client, state) in combat.clients.iter() {
+        if !state.is_alive() || state.team == attacker_team {
+            continue;
+        }
+        if distance_squared_xz(blast, state.position) <= radius_squared {
+            events.push(DamageEvent {
+                attacker_team,
+                target: CombatTarget::Client(client),
+                damage: PLAYER_WEAPON_DAMAGE,
+            });
+        }
+    }
+
+    apply_damage_events(
+        runtime,
+        &mut *combat.entities,
+        &mut *combat.clients,
+        &mut *combat.match_state,
+        events,
+        tick,
+    )
+}
+
+fn apply_damage_events(
+    runtime: &mut ServerRuntime,
+    entities: &mut [DemoEntity],
+    clients: &mut HashMap<ClientId, ClientState>,
+    match_state: &mut DeathmatchState,
+    events: Vec<DamageEvent>,
+    tick: u64,
+) -> CombatStats {
+    let mut stats = CombatStats::default();
+    for event in events {
+        match event.target {
+            CombatTarget::Bot(index) => {
+                let Some(entity) = entities.get_mut(index) else {
+                    continue;
+                };
+                if !entity.is_combatant()
+                    || !entity.is_alive()
+                    || entity.team == event.attacker_team
+                {
+                    continue;
+                }
+                entity.health = (entity.health - event.damage).max(0.0);
+                stats.combat_hits += 1;
+                if entity.health <= 0.0 {
+                    entity.respawn_tick = tick.saturating_add(BOT_RESPAWN_TICKS);
+                    runtime.despawn_entity(entity.entity);
+                    match_state.add_score(event.attacker_team);
+                    stats.kills += 1;
+                }
+            }
+            CombatTarget::Client(client_id) => {
+                let Some(client) = clients.get_mut(&client_id) else {
+                    continue;
+                };
+                if !client.is_alive() || client.team == event.attacker_team {
+                    continue;
+                }
+                client.health = (client.health - event.damage).max(0.0);
+                stats.combat_hits += 1;
+                if client.health <= 0.0 {
+                    client.respawn_tick = tick.saturating_add(PLAYER_RESPAWN_TICKS);
+                    match_state.add_score(event.attacker_team);
+                    stats.kills += 1;
+                }
+                set_player_payload(runtime, client, *match_state);
+            }
+        }
+    }
+    stats
 }
 
 fn update_destructible_world(
@@ -1130,7 +1549,7 @@ fn demo_entity(raw_entity: u64, kind: u8, index: u64, world_size: f32) -> DemoEn
     DemoEntity {
         entity: EntityId::new(raw_entity),
         kind,
-        team: (index % 3) as u8,
+        team: (index % TEAM_COUNT as u64) as u8,
         anchor,
         orbit_radius: if kind == KIND_EFFECT {
             3.0 + lane * 0.4
@@ -1145,6 +1564,12 @@ fn demo_entity(raw_entity: u64, kind: u8, index: u64, world_size: f32) -> DemoEn
         phase: hash_unit(index.wrapping_mul(97)) * std::f32::consts::TAU,
         radius: if kind == KIND_EFFECT { 0.65 } else { 1.0 },
         style: (index % 7) as u32,
+        health: if kind == KIND_BOT {
+            BOT_MAX_HEALTH
+        } else {
+            1.0
+        },
+        respawn_tick: 0,
     }
 }
 
@@ -1191,17 +1616,30 @@ fn payloads_for_entity(
     )
 }
 
-fn player_payload(lod: u8, position: Vec3, yaw: f32) -> Vec<u8> {
+fn player_payload(lod: u8, client: &ClientState, match_state: DeathmatchState) -> Vec<u8> {
     encode_demo_payload(DemoPayload {
         kind: KIND_PLAYER,
-        team: 3,
+        team: client.team,
         lod,
-        position,
-        yaw,
+        position: client.position,
+        yaw: client.yaw,
         radius: 1.2,
-        phase: 0.0,
-        style: 0,
+        phase: client.health_ratio(),
+        style: match_state.packed_scores(),
     })
+}
+
+fn score_payloads(team: u8, position: Vec3, match_state: DeathmatchState) -> NetworkLodPayloads {
+    let team_score = match_state.team_scores[team as usize] as f32;
+    payloads_for_entity(
+        KIND_SCOREBOARD,
+        team,
+        position,
+        0.0,
+        5.0,
+        team_score,
+        match_state.packed_scores(),
+    )
 }
 
 fn cover_style(material: u8, health_ratio: f32) -> u32 {
@@ -1262,9 +1700,31 @@ fn parse_client_input(payload: &[u8]) -> Option<ClientInput> {
     })
 }
 
-fn player_spawn(client: ClientId) -> Vec3 {
-    let angle = client.raw() as f32 * 1.618_034;
-    Vec3::new(angle.cos() * 12.0, 0.5, angle.sin() * 12.0)
+fn team_for_client(client: ClientId) -> u8 {
+    ((client.raw().saturating_sub(1)) % TEAM_COUNT as u64) as u8
+}
+
+fn team_name(team: u8) -> &'static str {
+    match team {
+        TEAM_RED => "red",
+        TEAM_BLUE => "blue",
+        _ => "unknown",
+    }
+}
+
+fn team_base_position(team: u8, world_size: f32) -> Vec3 {
+    let lane = if team == TEAM_RED { -1.0 } else { 1.0 };
+    Vec3::new(lane * world_size * 0.22, 0.5, 0.0)
+}
+
+fn player_spawn(client: ClientId, team: u8) -> Vec3 {
+    let base = team_base_position(team, 512.0);
+    let offset = client.raw() as f32 * 1.618_034;
+    Vec3::new(
+        base.x + offset.sin() * 8.0,
+        0.5,
+        base.z + offset.cos() * 12.0,
+    )
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> io::Result<Args> {

@@ -22,6 +22,10 @@ const KIND_PLAYER := 1
 const KIND_EFFECT := 2
 const KIND_COVER := 3
 const KIND_IMPACT := 4
+const KIND_SCOREBOARD := 5
+
+const TEAM_RED := 0
+const TEAM_BLUE := 1
 
 const LOD_FULL := 0
 const LOD_REDUCED := 1
