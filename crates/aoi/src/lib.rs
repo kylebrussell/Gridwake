@@ -43,6 +43,13 @@ pub struct EntityEntry {
     cell: CellCoord,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AoiQueryEntity {
+    pub entity: EntityId,
+    pub position: Vec3,
+    pub distance_squared: f32,
+}
+
 #[derive(Debug)]
 pub struct GridAoi {
     config: GridAoiConfig,
@@ -137,8 +144,11 @@ impl GridAoi {
         (min, max)
     }
 
-    pub fn query_observer_into(&self, observer: ClientId, out: &mut Vec<EntityId>) -> bool {
-        out.clear();
+    fn query_observer_with(
+        &self,
+        observer: ClientId,
+        mut push: impl FnMut(EntityId, Vec3, f32),
+    ) -> bool {
         let Some(observer) = self.observers.get(&observer) else {
             return false;
         };
@@ -158,8 +168,9 @@ impl GridAoi {
                             continue;
                         };
 
-                        if observer.position.distance_squared(entry.position) <= radius_squared {
-                            out.push(entity);
+                        let distance_squared = observer.position.distance_squared(entry.position);
+                        if distance_squared <= radius_squared {
+                            push(entity, entry.position, distance_squared);
                         }
                     }
                 }
@@ -167,6 +178,26 @@ impl GridAoi {
         }
 
         true
+    }
+
+    pub fn query_observer_into(&self, observer: ClientId, out: &mut Vec<EntityId>) -> bool {
+        out.clear();
+        self.query_observer_with(observer, |entity, _, _| out.push(entity))
+    }
+
+    pub fn query_observer_entities_into(
+        &self,
+        observer: ClientId,
+        out: &mut Vec<AoiQueryEntity>,
+    ) -> bool {
+        out.clear();
+        self.query_observer_with(observer, |entity, position, distance_squared| {
+            out.push(AoiQueryEntity {
+                entity,
+                position,
+                distance_squared,
+            });
+        })
     }
 }
 
@@ -273,6 +304,28 @@ mod tests {
         aoi.insert_entity(far, vec3(13.0, 0.0, 0.0));
 
         assert_eq!(aoi.query_observer(observer).unwrap(), vec![near]);
+    }
+
+    #[test]
+    fn query_entities_returns_position_and_distance() {
+        let mut aoi = GridAoi::new(GridAoiConfig::new(10.0));
+        let observer = ClientId::new(1);
+        let near = EntityId::new(10);
+        let position = vec3(3.0, 4.0, 0.0);
+        let mut result = Vec::new();
+
+        aoi.insert_observer(observer, Vec3::ZERO, 12.0);
+        aoi.insert_entity(near, position);
+
+        assert!(aoi.query_observer_entities_into(observer, &mut result));
+        assert_eq!(
+            result,
+            vec![AoiQueryEntity {
+                entity: near,
+                position,
+                distance_squared: 25.0,
+            }]
+        );
     }
 
     #[test]

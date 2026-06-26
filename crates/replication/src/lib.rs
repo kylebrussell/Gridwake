@@ -315,6 +315,29 @@ impl ReplicationGraph {
         }
     }
 
+    pub fn set_visible_from_index(
+        &mut self,
+        client: ClientId,
+        visible_entities: impl IntoIterator<Item = EntityId>,
+    ) -> VisibilityChange {
+        let client_state = self.clients.entry(client).or_default();
+        let next: HashSet<_> = visible_entities.into_iter().collect();
+        let mut exited: Vec<_> = client_state.visible.difference(&next).copied().collect();
+
+        for entity in &exited {
+            client_state.entities.remove(entity);
+        }
+
+        client_state.visible = next;
+        exited.sort_unstable();
+
+        VisibilityChange {
+            entered: Vec::new(),
+            exited,
+            visible: Vec::new(),
+        }
+    }
+
     pub fn visible_for_client(&self, client: ClientId) -> Option<Vec<EntityId>> {
         let mut visible: Vec<_> = self.clients.get(&client)?.visible.iter().copied().collect();
         visible.sort_unstable();
@@ -347,15 +370,34 @@ impl ReplicationGraph {
     pub fn select_for_client_with_lod_context(
         &mut self,
         client: ClientId,
-        mut budget: ByteBudget,
+        budget: ByteBudget,
         mut lod_for_entity: impl FnMut(NetworkLodSelectionContext) -> NetworkLod,
+    ) -> Selection {
+        let Some(client_state) = self.clients.get(&client) else {
+            return Selection::default();
+        };
+        let visible: Vec<_> = client_state.visible.iter().copied().collect();
+        self.select_visible_for_client_with_lod_context(
+            client,
+            budget,
+            visible.into_iter().map(|entity| (entity, ())),
+            |context, _| lod_for_entity(context),
+        )
+    }
+
+    pub fn select_visible_for_client_with_lod_context<T>(
+        &mut self,
+        client: ClientId,
+        mut budget: ByteBudget,
+        visible_entities: impl IntoIterator<Item = (EntityId, T)>,
+        mut lod_for_entity: impl FnMut(NetworkLodSelectionContext, &T) -> NetworkLod,
     ) -> Selection {
         let Some(client_state) = self.clients.get_mut(&client) else {
             return Selection::default();
         };
 
         let mut candidates = Vec::with_capacity(client_state.visible.len());
-        for &entity_id in &client_state.visible {
+        for (entity_id, data) in visible_entities {
             let Some(entity) = self.entities.get(&entity_id) else {
                 continue;
             };
@@ -363,11 +405,14 @@ impl ReplicationGraph {
             let client_entity = client_state.entities.entry(entity_id).or_default();
             let last_sent = client_entity.last_sent_generation;
             let last_sent_lod = client_entity.last_sent_lod;
-            let lod = lod_for_entity(NetworkLodSelectionContext {
-                entity: entity_id,
-                default_lod: entity.lod,
-                last_sent_lod,
-            });
+            let lod = lod_for_entity(
+                NetworkLodSelectionContext {
+                    entity: entity_id,
+                    default_lod: entity.lod,
+                    last_sent_lod,
+                },
+                &data,
+            );
             if entity.generation <= last_sent && last_sent_lod == Some(lod) {
                 continue;
             }
@@ -503,6 +548,29 @@ mod tests {
         assert_eq!(second.entered, vec![c]);
         assert_eq!(second.exited, vec![a]);
         assert_eq!(second.visible, vec![b, c]);
+    }
+
+    #[test]
+    fn indexed_visibility_reports_exits_and_clears_client_entity_state() {
+        let mut graph = ReplicationGraph::new();
+        let client = ClientId::new(1);
+        let a = EntityId::new(10);
+        let b = EntityId::new(11);
+
+        graph.register_client(client);
+        graph.upsert_entity(a, 10, 1.0);
+        graph.upsert_entity(b, 10, 1.0);
+        graph.set_visible_from_index(client, [a, b]);
+        graph.select_for_client(client, ByteBudget::new(20));
+        assert_eq!(graph.last_sent_lod(client, a), Some(NetworkLod::Full));
+
+        let change = graph.set_visible_from_index(client, [b]);
+
+        assert!(change.entered.is_empty());
+        assert_eq!(change.exited, vec![a]);
+        assert!(change.visible.is_empty());
+        assert_eq!(graph.last_sent_lod(client, a), None);
+        assert_eq!(graph.visible_for_client(client), Some(vec![b]));
     }
 
     #[test]

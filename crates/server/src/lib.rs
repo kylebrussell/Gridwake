@@ -3,7 +3,7 @@ use std::io::{self, ErrorKind};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::Duration;
 
-use gridwake_aoi::{CellCoord, GridAoi, GridAoiConfig, InterestIndex};
+use gridwake_aoi::{AoiQueryEntity, CellCoord, GridAoi, GridAoiConfig, InterestIndex};
 use gridwake_core::{ByteBudget, ClientId, EntityId, RegionId, SnapshotId, Tick, Vec3};
 use gridwake_protocol::{
     decode_client_message_with_config, encode_client_message, encode_server_message, ClientMessage,
@@ -11,7 +11,9 @@ use gridwake_protocol::{
 };
 pub use gridwake_replication::NetworkLod;
 use gridwake_replication::{NetworkLodBytes, ReplicationGraph, VisibilityChange};
-use gridwake_snapshot::{build_delta, AckTracker, DeltaOp, SnapshotFrame, SnapshotHistory};
+use gridwake_snapshot::{
+    build_delta, AckTracker, DeltaOp, DeltaSnapshot, SnapshotFrame, SnapshotHistory,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NetworkLodPolicy {
@@ -1180,33 +1182,35 @@ impl ServerRuntime {
 
         let mut clients: Vec<_> = self.clients.keys().copied().collect();
         clients.sort_unstable();
-        let mut visible_entities = Vec::new();
+        let mut visible_entities: Vec<AoiQueryEntity> = Vec::new();
 
         for client in clients {
-            if !self.aoi.query_observer_into(client, &mut visible_entities) {
+            if !self
+                .aoi
+                .query_observer_entities_into(client, &mut visible_entities)
+            {
                 continue;
             }
             metrics.aoi_candidates += visible_entities.len();
-            let visibility = self
-                .replication
-                .set_visibility(client, visible_entities.drain(..));
+            let visibility = self.replication.set_visible_from_index(
+                client,
+                visible_entities.iter().map(|visible| visible.entity),
+            );
             let Some(client_state) = self.clients.get(&client) else {
                 continue;
             };
             let client_position = client_state.position;
             let interest_radius = client_state.interest_radius;
             let network_lod_policy = self.config.network_lod;
-            let entities = &self.entities;
-            let selection = self.replication.select_for_client_with_lod_context(
+            let selection = self.replication.select_visible_for_client_with_lod_context(
                 client,
                 ByteBudget::new(self.config.per_client_byte_budget),
-                |context| {
-                    let Some(entity) = entities.get(&context.entity) else {
-                        return context.default_lod;
-                    };
-                    let distance_squared = client_position.distance_squared(entity.position);
+                visible_entities
+                    .iter()
+                    .map(|visible| (visible.entity, *visible)),
+                |context, visible| {
                     let policy_lod = network_lod_policy.lod_for_distance_squared_with_previous(
-                        distance_squared,
+                        visible.distance_squared,
                         interest_radius,
                         context.last_sent_lod,
                     );
@@ -1214,9 +1218,9 @@ impl ServerRuntime {
                         client,
                         entity: context.entity,
                         client_position,
-                        entity_position: entity.position,
+                        entity_position: visible.position,
                         interest_radius,
-                        distance_squared,
+                        distance_squared: visible.distance_squared,
                         entity_lod_cap: context.default_lod,
                         previous_lod: context.last_sent_lod,
                         policy_lod,
@@ -1243,18 +1247,34 @@ impl ServerRuntime {
                 continue;
             }
 
+            let latest_sequence = self.history.latest(client).map(|frame| frame.sequence);
+            let baseline = self
+                .acks
+                .latest(client)
+                .and_then(|sequence| self.history.get(client, sequence));
+            let baseline_sequence = baseline.map(|frame| frame.sequence);
             let frame = self.snapshot_frame_for_selection(
                 client,
                 snapshot_id,
                 &visibility,
                 &selection.updates,
             );
-            let baseline = self
-                .acks
-                .latest(client)
-                .and_then(|sequence| self.history.get(client, sequence));
-            let mut delta = build_delta(baseline, &frame);
-            if baseline.is_none() {
+            let can_build_direct_delta = match (baseline_sequence, latest_sequence) {
+                (Some(baseline), Some(latest)) => baseline == latest,
+                (None, None) => true,
+                _ => false,
+            };
+            let mut delta = if can_build_direct_delta {
+                self.delta_for_selection(
+                    snapshot_id,
+                    baseline_sequence,
+                    &visibility,
+                    &selection.updates,
+                )
+            } else {
+                build_delta(baseline, &frame)
+            };
+            if baseline_sequence.is_none() && !can_build_direct_delta {
                 delta.ops.extend(
                     visibility
                         .exited
@@ -1332,6 +1352,42 @@ impl ServerRuntime {
             }
         }
         frame
+    }
+
+    fn delta_for_selection(
+        &self,
+        snapshot_id: SnapshotId,
+        baseline: Option<SnapshotId>,
+        visibility: &VisibilityChange,
+        updates: &[gridwake_replication::SelectedUpdate],
+    ) -> DeltaSnapshot {
+        let mut ops = Vec::with_capacity(updates.len() + visibility.exited.len());
+        for update in updates {
+            let Some(entity) = self.entities.get(&update.entity) else {
+                continue;
+            };
+            let payload = entity.payload_for_lod(update.lod);
+            if update.first_for_client {
+                ops.push(DeltaOp::SpawnOrEnter {
+                    entity: update.entity,
+                    payload,
+                });
+            } else {
+                ops.push(DeltaOp::Update {
+                    entity: update.entity,
+                    payload,
+                });
+            }
+        }
+        ops.extend(
+            visibility
+                .exited
+                .iter()
+                .copied()
+                .map(|entity| DeltaOp::DespawnOrExit { entity }),
+        );
+        ops.sort_by_key(DeltaOp::entity);
+        DeltaSnapshot::new(snapshot_id, baseline, ops)
     }
 
     fn record_lag_history(&mut self, tick: Tick) {
