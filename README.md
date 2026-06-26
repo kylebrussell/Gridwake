@@ -18,6 +18,10 @@ The project is intentionally not a renderer, editor, physics engine, matchmaking
 | `gridwake-server` | Authoritative runtime shell using fake/memory/UDP codec transports, inbound message pumping, fixed-step scheduling, metrics sinks, AOI, customizable budget-aware hysteresis-stabilized per-client LOD payloads, acked snapshot deltas, per-LOD and budget-deferred update metrics, bounded interpolated lag-history and sphere-hit validation hooks, cell ownership, and dispatchable cross-cell event batches. |
 | `gridwake-sim` | Runnable load-test harness with fake clients, fake entities, fixed-step ticks, named synthetic scenarios, and repeatable benchmark profiles. |
 
+## Demos
+
+- `examples/godot_psx_demo` is a Godot 4.7 grey-box++ client that connects to the Rust demo server example over UDP and renders AOI-filtered snapshot deltas as low-fidelity PS1-style primitives.
+
 ## Adjacent Projects
 
 As of the initial project check on 2026-06-25:
@@ -45,6 +49,7 @@ cargo run -p gridwake-sim -- --scenario uniform --clients 100 --entities 1000 --
 cargo run -p gridwake-sim -- --scenario dense-hotspot --clients 100 --entities 1000 --ticks 10
 cargo run -p gridwake-sim -- --scenario moving-battlefront --clients 100 --entities 1000 --ticks 10
 cargo run -p gridwake-sim -- --scenario sparse-open-world --clients 100 --entities 1000 --ticks 10 --report json
+cargo run -p gridwake-server --example godot_psx_demo_server -- --bots 2000 --effects 350
 ```
 
 ## Non-Goals

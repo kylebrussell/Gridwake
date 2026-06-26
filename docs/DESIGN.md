@@ -13,6 +13,7 @@ The workspace uses crate-level boundaries so each subsystem can be tested indepe
 - `gridwake-protocol` contains transport-neutral messages and a small versioned byte codec.
 - `gridwake-server` composes the crates into an authoritative fixed-step tick shell, adapts memory or UDP byte transports through the protocol codec, pumps inbound client messages, records metrics through sinks, applies customizable budget-aware hysteresis-stabilized per-client network LODs to snapshot payloads, reports per-LOD and budget-deferred update pressure, retains bounded entity-position history with exact and interpolated lag-compensation lookup plus rewound sphere-hit validation, and tracks cell ownership for local versus cross-region event routing into dispatchable region batches.
 - `gridwake-sim` drives fake clients and entities through deterministic synthetic scenarios and named benchmark profiles using the same fixed-step scheduler, then emits text or JSON summaries for repeatable load-test comparisons.
+- `examples/godot_psx_demo` is a thin Godot client integration: GDScript sends input through the transport-neutral client message codec, decodes snapshot deltas, and renders server-selected AOI state with simple PS1-style primitives.
 
 ## Data Flow
 
@@ -49,6 +50,8 @@ real transport adapter
 ```
 
 The first real socket adapter is a dependency-free UDP byte transport. It registers client socket addresses, records unknown-client or unknown-peer routing errors, and relies on the codec layer for typed Gridwake messages. Reliability, packet ordering, auth, NAT traversal, and production session lifecycle remain outside this adapter.
+
+The Godot demo uses the same protocol boundary from a non-Rust engine. It keeps engine code limited to input encoding, snapshot decoding, acknowledgement, and presentation, while the Rust server remains authoritative over AOI, replication priority, LOD choice, and snapshot deltas.
 
 The runtime can also be driven by elapsed wall-clock time:
 

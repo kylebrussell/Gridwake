@@ -9,7 +9,8 @@ use gridwake_protocol::{
     decode_client_message_with_config, encode_client_message, encode_server_message, ClientMessage,
     CodecError, DecodeConfig, MetricsFrame, RoutedClientMessage, ServerMessage,
 };
-use gridwake_replication::{NetworkLod, NetworkLodBytes, ReplicationGraph, VisibilityChange};
+pub use gridwake_replication::NetworkLod;
+use gridwake_replication::{NetworkLodBytes, ReplicationGraph, VisibilityChange};
 use gridwake_snapshot::{build_delta, AckTracker, DeltaOp, SnapshotFrame, SnapshotHistory};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
