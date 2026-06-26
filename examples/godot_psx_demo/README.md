@@ -7,7 +7,7 @@ This is a grey-box++ Godot 4.7 two-team deathmatch client for exercising Gridwak
 Start the Rust demo server:
 
 ```sh
-cargo run -p gridwake-server --example godot_psx_demo_server -- --bots 2000 --effects 350 --cover 900
+cargo run -p gridwake-server --example godot_psx_demo_server
 ```
 
 Open `examples/godot_psx_demo/project.godot` in Godot 4.7 and run the project.
@@ -17,7 +17,7 @@ For render performance, run it in a normal Godot window rather than headless:
 godot --path examples/godot_psx_demo
 ```
 
-The server defaults to a conservative `--budget 700` and `--max-datagram 1200`.
+The server default is a playable local match profile: 800 bots, 140 world effects, 520 destructible cover pieces, a 60-kill score limit, `--budget 2400`, and `--max-datagram 4096`.
 The demo transport splits oversized snapshot deltas into fragment datagrams, and
 the Godot client only acks a snapshot after all fragments have been reassembled.
 Fragments are applied progressively as they arrive, so extreme stress profiles
@@ -28,9 +28,11 @@ ceiling to avoid platform-specific UDP `Message too long` failures.
 Keyboard controls:
 
 - `W` / `S` or Up / Down: move forward/back
-- `A` / `D` or Left / Right: turn
-- `Q` / `E`: strafe
+- `A` / `D`: strafe
+- Mouse: aim
+- Left / Right or `Q` / `E`: keyboard turn fallback
 - Space or Left Mouse: fire a server-applied blast that damages enemy players/bots, damages destructible cover, and spawns a short-lived replicated impact
+- Escape: release/capture the mouse
 
 For a lighter local smoke:
 

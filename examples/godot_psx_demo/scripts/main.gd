@@ -7,6 +7,10 @@ const GridwakeProtocol := preload("res://scripts/gridwake_protocol.gd")
 @export var input_send_hz := 30.0
 @export var move_speed := 28.0
 @export var turn_speed := 2.4
+@export var mouse_sensitivity := 0.0032
+@export var camera_follow_distance := 9.0
+@export var camera_height := 4.2
+@export var camera_smoothing := 18.0
 @export var server_position_snap_distance := 28.0
 @export var max_visual_entities := 6000
 @export var max_packets_per_frame := 32
@@ -14,6 +18,7 @@ const GridwakeProtocol := preload("res://scripts/gridwake_protocol.gd")
 @export var perf_sample_hz := 4.0
 @export var perf_log_hz := 1.0
 @export var perf_log_enabled := true
+@export var show_perf_overlay := false
 
 var udp := PacketPeerUDP.new()
 var entity_nodes: Dictionary = {}
@@ -22,6 +27,8 @@ var instanced_entity_slots: Dictionary = {}
 var instanced_buckets: Dictionary = {}
 var player_position := Vector3(0.0, 0.5, 18.0)
 var player_yaw := 0.0
+var camera_initialized := false
+var camera_look_position := Vector3.ZERO
 var input_accumulator := 0.0
 var snapshot_sequence := -1
 var packets_received := 0
@@ -65,6 +72,7 @@ var prop_mesh: BoxMesh
 var materials: Dictionary = {}
 var camera: Camera3D
 var hud: Label
+var crosshair_root: Control
 var cover_nodes: Dictionary = {}
 var damaged_cover_nodes: Dictionary = {}
 var ruined_cover_nodes: Dictionary = {}
@@ -77,8 +85,11 @@ var has_local_server_position := false
 var local_server_position := Vector3.ZERO
 var red_score := 0
 var blue_score := 0
+var winner_team := -1
+var round_index := 1
 
 func _ready() -> void:
+	Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
 	_setup_rendering()
 	_setup_world()
 	_setup_udp()
@@ -91,6 +102,23 @@ func _exit_tree() -> void:
 	udp.close()
 
 
+func _input(event: InputEvent) -> void:
+	if event is InputEventMouseButton and event.pressed:
+		Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
+	if event is InputEventMouseMotion and Input.get_mouse_mode() == Input.MOUSE_MODE_CAPTURED and local_player_health > 0.0:
+		player_yaw -= event.relative.x * mouse_sensitivity
+	if event is InputEventKey and event.pressed and event.keycode == KEY_ESCAPE:
+		if Input.get_mouse_mode() == Input.MOUSE_MODE_CAPTURED:
+			Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
+		else:
+			Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
+
+
+func _process(delta: float) -> void:
+	_update_camera(delta)
+	_update_hud()
+
+
 func _physics_process(delta: float) -> void:
 	_update_player(delta)
 	_poll_network()
@@ -99,8 +127,6 @@ func _physics_process(delta: float) -> void:
 	if input_accumulator >= 1.0 / input_send_hz:
 		input_accumulator = 0.0
 		_send_input()
-	_update_camera()
-	_update_hud()
 
 
 func _setup_rendering() -> void:
@@ -156,7 +182,37 @@ func _setup_world() -> void:
 	hud.add_theme_constant_override("shadow_offset_x", 2)
 	hud.add_theme_constant_override("shadow_offset_y", 2)
 	canvas.add_child(hud)
+	_create_crosshair(canvas)
 	add_child(canvas)
+
+
+func _create_crosshair(canvas: CanvasLayer) -> void:
+	crosshair_root = Control.new()
+	crosshair_root.set_anchors_preset(Control.PRESET_FULL_RECT)
+	crosshair_root.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	canvas.add_child(crosshair_root)
+
+	var color := Color(0.78, 0.95, 1.0, 0.78)
+	crosshair_root.add_child(_crosshair_rect(Vector2(-1.0, -1.0), Vector2(2.0, 2.0), color))
+	crosshair_root.add_child(_crosshair_rect(Vector2(-1.0, -14.0), Vector2(2.0, 8.0), color))
+	crosshair_root.add_child(_crosshair_rect(Vector2(-1.0, 6.0), Vector2(2.0, 8.0), color))
+	crosshair_root.add_child(_crosshair_rect(Vector2(-14.0, -1.0), Vector2(8.0, 2.0), color))
+	crosshair_root.add_child(_crosshair_rect(Vector2(6.0, -1.0), Vector2(8.0, 2.0), color))
+
+
+func _crosshair_rect(offset: Vector2, size: Vector2, color: Color) -> ColorRect:
+	var rect := ColorRect.new()
+	rect.color = color
+	rect.anchor_left = 0.5
+	rect.anchor_top = 0.5
+	rect.anchor_right = 0.5
+	rect.anchor_bottom = 0.5
+	rect.offset_left = offset.x
+	rect.offset_top = offset.y
+	rect.offset_right = offset.x + size.x
+	rect.offset_bottom = offset.y + size.y
+	rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	return rect
 
 
 func _create_materials() -> void:
@@ -183,7 +239,7 @@ func _create_materials() -> void:
 	materials["grid"] = _material(Color(0.22, 0.28, 0.32))
 	materials["prop_wall"] = _material(Color(0.38, 0.43, 0.48))
 	materials["prop_trim"] = _material(Color(0.14, 0.52, 0.56))
-	materials["prop_signal"] = _material(Color(0.92, 0.72, 0.26))
+	materials["prop_signal"] = _material(Color(0.35, 0.70, 0.66))
 	materials["prop_barrel"] = _material(Color(0.62, 0.18, 0.20))
 
 
@@ -291,9 +347,9 @@ func _update_player(delta: float) -> void:
 		return
 
 	var turn := 0.0
-	if Input.is_key_pressed(KEY_LEFT) or Input.is_key_pressed(KEY_A):
+	if Input.is_key_pressed(KEY_LEFT) or Input.is_key_pressed(KEY_Q):
 		turn += 1.0
-	if Input.is_key_pressed(KEY_RIGHT) or Input.is_key_pressed(KEY_D):
+	if Input.is_key_pressed(KEY_RIGHT) or Input.is_key_pressed(KEY_E):
 		turn -= 1.0
 	player_yaw += turn * turn_speed * delta
 
@@ -304,9 +360,9 @@ func _update_player(delta: float) -> void:
 		movement += forward
 	if Input.is_key_pressed(KEY_DOWN) or Input.is_key_pressed(KEY_S):
 		movement -= forward
-	if Input.is_key_pressed(KEY_Q):
+	if Input.is_key_pressed(KEY_A):
 		movement -= right
-	if Input.is_key_pressed(KEY_E):
+	if Input.is_key_pressed(KEY_D):
 		movement += right
 	if movement.length_squared() > 0.0:
 		player_position += movement.normalized() * move_speed * delta
@@ -556,6 +612,14 @@ func _update_match_state(entity: int, payload: Dictionary) -> void:
 		var packed_scores := int(payload["style"])
 		red_score = packed_scores & 0x0fff
 		blue_score = (packed_scores >> 12) & 0x0fff
+		var winner_code := (packed_scores >> 24) & 0x03
+		if winner_code == 1:
+			winner_team = GridwakeProtocol.TEAM_RED
+		elif winner_code == 2:
+			winner_team = GridwakeProtocol.TEAM_BLUE
+		else:
+			winner_team = -1
+		round_index = ((packed_scores >> 26) & 0x3f) + 1
 
 
 func _update_cover_counters(entity: int, payload: Dictionary) -> void:
@@ -848,53 +912,75 @@ func _log_perf() -> void:
 	)
 
 
-func _update_camera() -> void:
+func _update_camera(delta: float) -> void:
 	var forward := Vector3(sin(player_yaw), 0.0, cos(player_yaw))
-	camera.position = player_position - forward * 18.0 + Vector3(0.0, 13.0, 0.0)
-	camera.look_at(player_position + forward * 7.0, Vector3.UP)
+	var desired_position := player_position - forward * camera_follow_distance + Vector3(0.0, camera_height, 0.0)
+	var desired_look := player_position + forward * 16.0 + Vector3(0.0, 1.1, 0.0)
+	var alpha := 1.0 - exp(-camera_smoothing * delta)
+	if not camera_initialized:
+		camera.position = desired_position
+		camera_look_position = desired_look
+		camera_initialized = true
+	else:
+		camera.position = camera.position.lerp(desired_position, alpha)
+		camera_look_position = camera_look_position.lerp(desired_look, alpha)
+	camera.look_at(camera_look_position, Vector3.UP)
 
 
 func _update_hud() -> void:
 	var status := "ALIVE" if local_player_health > 0.0 else "RESPAWNING"
-	hud.text = "Gridwake Deathmatch\nRED %d  BLUE %d\nteam %s health %d%% %s\nserver %s:%d\nfps %.1f frame %.2fms proc %.2fms phys %.2fms\nvisible %d / cap %d instanced %d buckets %d nodes %d resources %d\nrender draw %d objects %d prim %d mem %.1fMB\ncover %d damaged %d ruined %d impacts %d score_nodes %d\nsnapshot %d udp %d last %d %.1f/s backlog %d fragments %d pending %d %.1f/s ops %d %.1f/s\n%s" % [
+	var winner_text := ""
+	if winner_team != -1:
+		status = "ROUND END"
+		winner_text = "  WINNER %s" % _team_name(winner_team)
+	var text := "Gridwake Deathmatch\nROUND %d  RED %d  BLUE %d%s\nteam %s  health %d%%  %s" % [
+		round_index,
 		red_score,
 		blue_score,
+		winner_text,
 		_team_name(local_player_team),
 		int(round(local_player_health * 100.0)),
 		status,
-		server_host,
-		server_port,
-		perf_fps,
-		perf_frame_ms,
-		perf_process_ms,
-		perf_physics_ms,
-		_visible_entity_count(),
-		max_visual_entities,
-		instanced_entity_slots.size(),
-		instanced_buckets.size(),
-		perf_node_count,
-		perf_resource_count,
-		perf_draw_calls,
-		perf_render_objects,
-		perf_render_primitives,
-		perf_static_memory_mb,
-		cover_nodes.size(),
-		damaged_cover_nodes.size(),
-		ruined_cover_nodes.size(),
-		impact_nodes.size(),
-		score_nodes.size(),
-		snapshot_sequence,
-		udp_packets_received,
-		udp_packets_last_frame,
-		perf_udp_packets_per_sec,
-		packets_backlogged,
-		fragments_received,
-		snapshot_fragments.size(),
-		perf_fragments_per_sec,
-		ops_received,
-		perf_ops_per_sec,
-		last_server_error,
 	]
+	if show_perf_overlay:
+		text += "\nserver %s:%d\nfps %.1f frame %.2fms proc %.2fms phys %.2fms\nvisible %d / cap %d instanced %d buckets %d nodes %d resources %d\nrender draw %d objects %d prim %d mem %.1fMB\ncover %d damaged %d ruined %d impacts %d score_nodes %d\nsnapshot %d udp %d last %d %.1f/s backlog %d fragments %d pending %d %.1f/s ops %d %.1f/s" % [
+			server_host,
+			server_port,
+			perf_fps,
+			perf_frame_ms,
+			perf_process_ms,
+			perf_physics_ms,
+			_visible_entity_count(),
+			max_visual_entities,
+			instanced_entity_slots.size(),
+			instanced_buckets.size(),
+			perf_node_count,
+			perf_resource_count,
+			perf_draw_calls,
+			perf_render_objects,
+			perf_render_primitives,
+			perf_static_memory_mb,
+			cover_nodes.size(),
+			damaged_cover_nodes.size(),
+			ruined_cover_nodes.size(),
+			impact_nodes.size(),
+			score_nodes.size(),
+			snapshot_sequence,
+			udp_packets_received,
+			udp_packets_last_frame,
+			perf_udp_packets_per_sec,
+			packets_backlogged,
+			fragments_received,
+			snapshot_fragments.size(),
+			perf_fragments_per_sec,
+			ops_received,
+			perf_ops_per_sec,
+		]
+	if last_server_error != "":
+		text += "\n%s" % last_server_error
+	hud.text = text
+	if crosshair_root != null:
+		crosshair_root.visible = local_player_health > 0.0 and Input.get_mouse_mode() == Input.MOUSE_MODE_CAPTURED
 
 
 func _team_name(team: int) -> String:

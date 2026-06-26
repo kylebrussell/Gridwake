@@ -57,8 +57,11 @@ const PLAYER_WEAPON_DAMAGE: f32 = 65.0;
 const BOT_WEAPON_RANGE: f32 = 28.0;
 const BOT_WEAPON_DAMAGE: f32 = 18.0;
 const BOT_FIRE_INTERVAL_TICKS: u64 = 18;
+const BOT_ACTIVE_CLIENT_RADIUS: f32 = 210.0;
 const BOT_RESPAWN_TICKS: u64 = 70;
 const PLAYER_RESPAWN_TICKS: u64 = 55;
+const MATCH_SCORE_LIMIT: u32 = 60;
+const MATCH_RESET_TICKS: u64 = 120;
 const SCORE_ENTITY_BASE: u64 = 8_000_000;
 
 #[derive(Clone, Debug)]
@@ -80,14 +83,14 @@ impl Default for Args {
     fn default() -> Self {
         Self {
             bind: "127.0.0.1:3456".to_owned(),
-            bots: 2_000,
-            effects: 350,
-            cover: 900,
+            bots: 800,
+            effects: 140,
+            cover: 520,
             tick_rate_hz: 20,
             world_size: 512.0,
-            interest_radius: 128.0,
-            byte_budget: 700,
-            max_datagram_bytes: 1_200,
+            interest_radius: 176.0,
+            byte_budget: 2_400,
+            max_datagram_bytes: 4_096,
             log_every_ticks: 20,
             run_ticks: None,
         }
@@ -355,18 +358,46 @@ impl ClientState {
 #[derive(Clone, Copy, Debug, Default)]
 struct DeathmatchState {
     team_scores: [u32; TEAM_COUNT],
+    winner: Option<u8>,
+    reset_tick: u64,
+    round: u32,
 }
 
 impl DeathmatchState {
-    fn add_score(&mut self, team: u8) {
+    fn is_round_active(self) -> bool {
+        self.winner.is_none()
+    }
+
+    fn add_score(&mut self, team: u8, tick: u64) {
+        if !self.is_round_active() {
+            return;
+        }
         if let Some(score) = self.team_scores.get_mut(team as usize) {
             *score = score.saturating_add(1);
+            if *score >= MATCH_SCORE_LIMIT {
+                self.winner = Some(team);
+                self.reset_tick = tick.saturating_add(MATCH_RESET_TICKS);
+            }
         }
     }
 
     fn packed_scores(self) -> u32 {
+        let winner_bits = match self.winner {
+            Some(TEAM_RED) => 1,
+            Some(TEAM_BLUE) => 2,
+            _ => 0,
+        };
         (self.team_scores[TEAM_RED as usize].min(0x0fff))
             | (self.team_scores[TEAM_BLUE as usize].min(0x0fff) << 12)
+            | (winner_bits << 24)
+            | ((self.round.min(0x3f)) << 26)
+    }
+
+    fn reset_round(&mut self) {
+        self.team_scores = [0; TEAM_COUNT];
+        self.winner = None;
+        self.reset_tick = 0;
+        self.round = self.round.saturating_add(1);
     }
 }
 
@@ -760,11 +791,27 @@ fn main() -> io::Result<()> {
             let tick_started = Instant::now();
             tick_count = tick_count.saturating_add(1);
             let seconds = started.elapsed().as_secs_f32();
+            {
+                let mut round = RoundResetState {
+                    entities: &mut demo_entities,
+                    covers: &mut covers,
+                    clients: &mut clients,
+                };
+                maybe_reset_round(
+                    &mut runtime,
+                    &mut round,
+                    &mut match_state,
+                    &args,
+                    seconds,
+                    tick_count,
+                );
+            }
             let update_started = Instant::now();
             let combat_events = update_demo_entities(
                 &mut runtime,
                 &mut demo_entities,
                 &clients,
+                match_state,
                 seconds,
                 tick_count,
             );
@@ -811,8 +858,9 @@ fn main() -> io::Result<()> {
 
             if metrics.tick.raw() % args.log_every_ticks == 0 {
                 println!(
-                    "tick={} clients={} entities={} aoi={} selected={} lod={}/{}/{} deferred={} bytes={} messages={} score={}:{} kills={} combat_hits={} cover_hits={} cover_destroyed={} impacts={} active_impacts={} ms={:.3}/{:.3}/{:.3}/{:.3} datagrams={} net_bytes={} fragments={} send_errors={}",
+                    "tick={} round={} clients={} entities={} aoi={} selected={} lod={}/{}/{} deferred={} bytes={} messages={} score={}:{} winner={} kills={} combat_hits={} cover_hits={} cover_destroyed={} impacts={} active_impacts={} ms={:.3}/{:.3}/{:.3}/{:.3} datagrams={} net_bytes={} fragments={} send_errors={}",
                     metrics.tick.raw(),
+                    match_state.round.saturating_add(1),
                     metrics.clients,
                     metrics.entities,
                     metrics.aoi_candidates,
@@ -825,6 +873,10 @@ fn main() -> io::Result<()> {
                     metrics.messages_sent,
                     match_state.team_scores[TEAM_RED as usize],
                     match_state.team_scores[TEAM_BLUE as usize],
+                    match_state
+                        .winner
+                        .map(team_name)
+                        .unwrap_or("none"),
                     combat_stats.kills,
                     combat_stats.combat_hits,
                     world_events.cover_hits,
@@ -899,6 +951,12 @@ struct DeathmatchWorldState<'a> {
     match_state: &'a mut DeathmatchState,
 }
 
+struct RoundResetState<'a> {
+    entities: &'a mut [DemoEntity],
+    covers: &'a mut [DemoCover],
+    clients: &'a mut HashMap<ClientId, ClientState>,
+}
+
 struct CombatWriteState<'a> {
     entities: &'a mut [DemoEntity],
     clients: &'a mut HashMap<ClientId, ClientState>,
@@ -945,7 +1003,10 @@ fn handle_inbound(
                         runtime.update_client_position(inbound.client, input.position);
                         runtime.move_entity(client.player_entity, input.position);
                         set_player_payload(runtime, client, *deathmatch.match_state);
-                        if input.fire && tick >= client.next_fire_tick {
+                        if input.fire
+                            && deathmatch.match_state.is_round_active()
+                            && tick >= client.next_fire_tick
+                        {
                             let forward = Vec3::new(input.yaw.sin(), 0.0, input.yaw.cos());
                             let blast = Vec3::new(
                                 input.position.x + forward.x * PLAYER_WEAPON_RANGE * 0.65,
@@ -1056,11 +1117,61 @@ fn update_client_payloads(
     tick: u64,
 ) {
     for (&client_id, client) in clients.iter_mut() {
-        if !client.is_alive() && tick >= client.respawn_tick {
+        if match_state.is_round_active() && !client.is_alive() && tick >= client.respawn_tick {
             respawn_client(runtime, client_id, client, match_state);
         }
         set_player_payload(runtime, client, match_state);
     }
+}
+
+fn maybe_reset_round(
+    runtime: &mut ServerRuntime,
+    round: &mut RoundResetState<'_>,
+    match_state: &mut DeathmatchState,
+    args: &Args,
+    seconds: f32,
+    tick: u64,
+) {
+    let Some(_winner) = match_state.winner else {
+        return;
+    };
+    if tick < match_state.reset_tick {
+        return;
+    }
+
+    match_state.reset_round();
+    for entity in round.entities.iter_mut() {
+        if entity.kind != KIND_BOT {
+            continue;
+        }
+        entity.health = BOT_MAX_HEALTH;
+        entity.respawn_tick = 0;
+        let position = entity.position_at(seconds);
+        runtime.spawn_entity_with_lod_payloads(
+            entity.entity,
+            position,
+            entity.payloads_at_position(seconds, position),
+            1.0 + f32::from(entity.team) * 0.25,
+            NetworkLod::Full,
+        );
+    }
+
+    for cover in round.covers.iter_mut() {
+        cover.health = COVER_MAX_HEALTH;
+        let payloads = cover.payloads();
+        runtime.set_entity_lod_payloads(
+            cover.entity,
+            payloads.full,
+            payloads.reduced,
+            payloads.minimal,
+        );
+    }
+
+    for (&client_id, client) in round.clients.iter_mut() {
+        respawn_client(runtime, client_id, client, *match_state);
+    }
+    update_score_entities(runtime, args, *match_state);
+    println!("round {} start", match_state.round.saturating_add(1));
 }
 
 fn set_player_payload(
@@ -1190,17 +1301,18 @@ fn update_demo_entities(
     runtime: &mut ServerRuntime,
     entities: &mut [DemoEntity],
     clients: &HashMap<ClientId, ClientState>,
+    match_state: DeathmatchState,
     seconds: f32,
     tick: u64,
 ) -> Vec<DamageEvent> {
     let mut damage_events = Vec::new();
-    let match_active = !clients.is_empty();
+    let match_active = !clients.is_empty() && match_state.is_round_active();
     for index in 0..entities.len() {
         let mut shooter = None;
         {
             let entity = &mut entities[index];
             if entity.is_combatant() && !entity.is_alive() {
-                if tick >= entity.respawn_tick {
+                if match_state.is_round_active() && tick >= entity.respawn_tick {
                     entity.health = BOT_MAX_HEALTH;
                     let position = entity.position_at(seconds);
                     runtime.spawn_entity_with_lod_payloads(
@@ -1220,6 +1332,7 @@ fn update_demo_entities(
 
             if match_active
                 && entity.is_combatant()
+                && near_active_client(position, clients)
                 && tick % BOT_FIRE_INTERVAL_TICKS == index as u64 % BOT_FIRE_INTERVAL_TICKS
             {
                 shooter = Some((entity.team, position));
@@ -1233,6 +1346,13 @@ fn update_demo_entities(
         }
     }
     damage_events
+}
+
+fn near_active_client(position: Vec3, clients: &HashMap<ClientId, ClientState>) -> bool {
+    let radius_squared = BOT_ACTIVE_CLIENT_RADIUS * BOT_ACTIVE_CLIENT_RADIUS;
+    clients.values().any(|client| {
+        client.is_alive() && distance_squared_xz(position, client.position) <= radius_squared
+    })
 }
 
 fn bot_fire_event(
@@ -1351,7 +1471,7 @@ fn apply_damage_events(
                 if entity.health <= 0.0 {
                     entity.respawn_tick = tick.saturating_add(BOT_RESPAWN_TICKS);
                     runtime.despawn_entity(entity.entity);
-                    match_state.add_score(event.attacker_team);
+                    match_state.add_score(event.attacker_team, tick);
                     stats.kills += 1;
                 }
             }
@@ -1366,7 +1486,7 @@ fn apply_damage_events(
                 stats.combat_hits += 1;
                 if client.health <= 0.0 {
                     client.respawn_tick = tick.saturating_add(PLAYER_RESPAWN_TICKS);
-                    match_state.add_score(event.attacker_team);
+                    match_state.add_score(event.attacker_team, tick);
                     stats.kills += 1;
                 }
                 set_player_payload(runtime, client, *match_state);
