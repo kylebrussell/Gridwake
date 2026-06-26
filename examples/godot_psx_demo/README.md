@@ -1,6 +1,6 @@
 # Gridwake Godot PSX Demo
 
-This is a grey-box++ Godot 4.7 client for exercising Gridwake as an engine-neutral server runtime. The Godot side is intentionally thin: it sends player input over UDP, decodes Gridwake snapshot deltas, and renders server-selected AOI state as low-fidelity PS1-style primitives.
+This is a grey-box++ Godot 4.7 client for exercising Gridwake as an engine-neutral server runtime. The Godot side is intentionally thin: it sends player input over UDP, decodes Gridwake snapshot deltas, and renders server-selected AOI state as low-fidelity PS1-style primitives. Bots, effects, and cover are batched into `MultiMeshInstance3D` buckets by mesh/material; player entities remain regular scene nodes.
 
 ## Run
 
@@ -36,4 +36,4 @@ For a repeatable server-side benchmark:
 cargo run --release -p gridwake-server --example godot_psx_demo_server -- --bots 2000 --effects 350 --cover 900 --budget 1400 --max-datagram 4096 --run-ticks 200
 ```
 
-The HUD shows visible entity count, snapshot sequence, packet backlog, pending fragments, and decoded op count. The server logs AOI candidates, selected updates, LOD mix, deferred updates, bytes, message counts, timing buckets, datagrams, bytes sent, and fragments sent.
+The HUD shows visible entity count, instanced bucket counts, snapshot sequence, packet backlog, pending fragments, and decoded op count. The server logs AOI candidates, selected updates, LOD mix, deferred updates, bytes, message counts, timing buckets, datagrams, bytes sent, and fragments sent.

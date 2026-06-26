@@ -13,6 +13,8 @@ const GridwakeProtocol := preload("res://scripts/gridwake_protocol.gd")
 var udp := PacketPeerUDP.new()
 var entity_nodes: Dictionary = {}
 var entity_material_keys: Dictionary = {}
+var instanced_entity_slots: Dictionary = {}
+var instanced_buckets: Dictionary = {}
 var player_position := Vector3(0.0, 0.5, 18.0)
 var player_yaw := 0.0
 var input_accumulator := 0.0
@@ -276,18 +278,25 @@ func _apply_snapshot_fragment(fragment: Dictionary) -> void:
 
 
 func _upsert_entity(entity: int, payload: Dictionary) -> void:
+	if int(payload["kind"]) == GridwakeProtocol.KIND_PLAYER:
+		_upsert_player_node(entity, payload)
+	else:
+		_upsert_instanced_entity(entity, payload)
+
+
+func _upsert_player_node(entity: int, payload: Dictionary) -> void:
+	if instanced_entity_slots.has(entity):
+		_release_instanced_entity(entity)
+
 	var node: MeshInstance3D
 	if entity_nodes.has(entity):
 		node = entity_nodes[entity]
-	elif entity_nodes.size() < max_visual_entities:
-		node = _create_entity_node(payload)
+	elif _visible_entity_count() < max_visual_entities:
+		node = MeshInstance3D.new()
+		node.mesh = player_mesh
 		entity_nodes[entity] = node
 		add_child(node)
 	else:
-		return
-
-	if int(payload["kind"]) == GridwakeProtocol.KIND_COVER:
-		_update_cover_node(entity, node, payload)
 		return
 
 	node.position = payload["position"]
@@ -298,29 +307,56 @@ func _upsert_entity(entity: int, payload: Dictionary) -> void:
 	_apply_material(entity, node, payload)
 
 
-func _create_entity_node(payload: Dictionary) -> MeshInstance3D:
-	var node := MeshInstance3D.new()
-	match int(payload["kind"]):
-		GridwakeProtocol.KIND_PLAYER:
-			node.mesh = player_mesh
-		GridwakeProtocol.KIND_EFFECT:
-			node.mesh = effect_mesh
-		GridwakeProtocol.KIND_COVER:
-			node.mesh = cover_mesh
-		_:
-			node.mesh = bot_mesh
-	return node
+func _upsert_instanced_entity(entity: int, payload: Dictionary) -> void:
+	if entity_nodes.has(entity):
+		var node: Node = entity_nodes[entity]
+		entity_nodes.erase(entity)
+		entity_material_keys.erase(entity)
+		node.queue_free()
+
+	if not instanced_entity_slots.has(entity) and _visible_entity_count() >= max_visual_entities:
+		return
+
+	var bucket_key := _bucket_key_for_payload(payload)
+	var transform := _transform_for_payload(payload)
+	var slot: Dictionary = instanced_entity_slots.get(entity, {})
+	if not slot.is_empty() and slot["bucket"] != bucket_key:
+		_release_instanced_entity(entity)
+		slot = {}
+
+	if slot.is_empty():
+		_add_instanced_entity(entity, bucket_key, transform)
+	else:
+		_update_instanced_entity(entity, transform)
+
+	if int(payload["kind"]) == GridwakeProtocol.KIND_COVER:
+		_update_cover_counters(entity, payload)
 
 
-func _update_cover_node(entity: int, node: MeshInstance3D, payload: Dictionary) -> void:
+func _transform_for_payload(payload: Dictionary) -> Transform3D:
+	if int(payload["kind"]) == GridwakeProtocol.KIND_COVER:
+		return _cover_transform_for_payload(payload)
+
+	var position: Vector3 = payload["position"]
+	var radius := float(payload["radius"])
+	var lod := int(payload["lod"])
+	var scale := Vector3.ONE * (radius * _lod_scale(lod))
+	var basis := Basis(Vector3.UP, float(payload["yaw"]))
+	basis = basis.scaled(scale)
+	return Transform3D(basis, position)
+
+
+func _cover_transform_for_payload(payload: Dictionary) -> Transform3D:
 	var health := _cover_health(payload)
 	var radius := float(payload["radius"])
 	var height := lerpf(0.22, 3.4, max(health, 0.08))
 	var position: Vector3 = payload["position"]
-	node.position = Vector3(position.x, height * 0.5 - 0.06, position.z)
-	node.rotation.y = 0.0
-	node.scale = Vector3(radius * 1.8, height, radius * 1.8)
-	_apply_material(entity, node, payload)
+	var basis := Basis.IDENTITY.scaled(Vector3(radius * 1.8, height, radius * 1.8))
+	return Transform3D(basis, Vector3(position.x, height * 0.5 - 0.06, position.z))
+
+
+func _update_cover_counters(entity: int, payload: Dictionary) -> void:
+	var health := _cover_health(payload)
 	cover_nodes[entity] = true
 	if health < 0.7:
 		damaged_cover_nodes[entity] = true
@@ -333,15 +369,141 @@ func _update_cover_node(entity: int, node: MeshInstance3D, payload: Dictionary) 
 
 
 func _remove_entity(entity: int) -> void:
-	if not entity_nodes.has(entity):
-		return
-	var node: Node = entity_nodes[entity]
-	entity_nodes.erase(entity)
-	entity_material_keys.erase(entity)
+	if entity_nodes.has(entity):
+		var node: Node = entity_nodes[entity]
+		entity_nodes.erase(entity)
+		entity_material_keys.erase(entity)
+		node.queue_free()
+	if instanced_entity_slots.has(entity):
+		_release_instanced_entity(entity)
 	cover_nodes.erase(entity)
 	damaged_cover_nodes.erase(entity)
 	ruined_cover_nodes.erase(entity)
-	node.queue_free()
+
+
+func _add_instanced_entity(entity: int, bucket_key: String, transform: Transform3D) -> void:
+	var bucket := _bucket_for_key(bucket_key)
+	var entities: Array = bucket["entities"]
+	var transforms: Array = bucket["transforms"]
+	var index := entities.size()
+	_ensure_bucket_capacity(bucket, index + 1)
+	entities.append(entity)
+	transforms.append(transform)
+	var multimesh: MultiMesh = bucket["multimesh"]
+	multimesh.set_instance_transform(index, transform)
+	multimesh.visible_instance_count = entities.size()
+	instanced_entity_slots[entity] = {
+		"bucket": bucket_key,
+		"index": index,
+	}
+
+
+func _update_instanced_entity(entity: int, transform: Transform3D) -> void:
+	var slot: Dictionary = instanced_entity_slots[entity]
+	var bucket: Dictionary = instanced_buckets[slot["bucket"]]
+	var index := int(slot["index"])
+	var transforms: Array = bucket["transforms"]
+	transforms[index] = transform
+	var multimesh: MultiMesh = bucket["multimesh"]
+	multimesh.set_instance_transform(index, transform)
+
+
+func _release_instanced_entity(entity: int) -> void:
+	var slot: Dictionary = instanced_entity_slots[entity]
+	var bucket_key := String(slot["bucket"])
+	var index := int(slot["index"])
+	var bucket: Dictionary = instanced_buckets[bucket_key]
+	var entities: Array = bucket["entities"]
+	var transforms: Array = bucket["transforms"]
+	var last_index := entities.size() - 1
+	var multimesh: MultiMesh = bucket["multimesh"]
+	if index != last_index:
+		var moved_entity := int(entities[last_index])
+		var moved_transform: Transform3D = transforms[last_index]
+		entities[index] = moved_entity
+		transforms[index] = moved_transform
+		var moved_slot: Dictionary = instanced_entity_slots[moved_entity]
+		moved_slot["index"] = index
+		instanced_entity_slots[moved_entity] = moved_slot
+		multimesh.set_instance_transform(index, moved_transform)
+	entities.pop_back()
+	transforms.pop_back()
+	instanced_entity_slots.erase(entity)
+	multimesh.visible_instance_count = entities.size()
+
+
+func _bucket_for_key(bucket_key: String) -> Dictionary:
+	if instanced_buckets.has(bucket_key):
+		return instanced_buckets[bucket_key]
+
+	var parts := bucket_key.split("|")
+	var mesh_key := String(parts[0])
+	var material_key := String(parts[1])
+	var multimesh := MultiMesh.new()
+	multimesh.transform_format = MultiMesh.TRANSFORM_3D
+	multimesh.mesh = _mesh_for_key(mesh_key)
+	multimesh.instance_count = 0
+	multimesh.visible_instance_count = 0
+
+	var node := MultiMeshInstance3D.new()
+	node.multimesh = multimesh
+	node.material_override = materials[material_key]
+	node.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	add_child(node)
+
+	var bucket := {
+		"node": node,
+		"multimesh": multimesh,
+		"entities": [],
+		"transforms": [],
+		"capacity": 0,
+	}
+	instanced_buckets[bucket_key] = bucket
+	return bucket
+
+
+func _ensure_bucket_capacity(bucket: Dictionary, needed: int) -> void:
+	var capacity := int(bucket["capacity"])
+	if needed <= capacity:
+		return
+	var next_capacity: int = max(64, capacity * 2)
+	while next_capacity < needed:
+		next_capacity *= 2
+	bucket["capacity"] = next_capacity
+	var multimesh: MultiMesh = bucket["multimesh"]
+	multimesh.instance_count = next_capacity
+	var transforms: Array = bucket["transforms"]
+	for index in range(transforms.size()):
+		multimesh.set_instance_transform(index, transforms[index])
+	multimesh.visible_instance_count = transforms.size()
+
+
+func _bucket_key_for_payload(payload: Dictionary) -> String:
+	return "%s|%s" % [_mesh_key_for_payload(payload), _material_key_for_payload(payload)]
+
+
+func _mesh_key_for_payload(payload: Dictionary) -> String:
+	match int(payload["kind"]):
+		GridwakeProtocol.KIND_EFFECT:
+			return "effect"
+		GridwakeProtocol.KIND_COVER:
+			return "cover"
+		_:
+			return "bot"
+
+
+func _mesh_for_key(mesh_key: String) -> Mesh:
+	match mesh_key:
+		"effect":
+			return effect_mesh
+		"cover":
+			return cover_mesh
+		_:
+			return bot_mesh
+
+
+func _visible_entity_count() -> int:
+	return entity_nodes.size() + instanced_entity_slots.size()
 
 
 func _apply_material(entity: int, node: MeshInstance3D, payload: Dictionary) -> void:
@@ -400,11 +562,14 @@ func _update_camera() -> void:
 
 
 func _update_hud() -> void:
-	hud.text = "Gridwake Godot Demo\nserver %s:%d\nvisible %d / cap %d\ncover %d damaged %d ruined %d\nsnapshot %d packets %d backlog %d fragments %d ops %d\n%s" % [
+	hud.text = "Gridwake Godot Demo\nserver %s:%d\nvisible %d / cap %d\ninstanced %d buckets %d nodes %d\ncover %d damaged %d ruined %d\nsnapshot %d packets %d backlog %d fragments %d ops %d\n%s" % [
 		server_host,
 		server_port,
-		entity_nodes.size(),
+		_visible_entity_count(),
 		max_visual_entities,
+		instanced_entity_slots.size(),
+		instanced_buckets.size(),
+		entity_nodes.size(),
 		cover_nodes.size(),
 		damaged_cover_nodes.size(),
 		ruined_cover_nodes.size(),
