@@ -7,25 +7,26 @@ This is a grey-box++ Godot 4.7 client for exercising Gridwake as an engine-neutr
 Start the Rust demo server:
 
 ```sh
-cargo run -p gridwake-server --example godot_psx_demo_server -- --bots 2000 --effects 350
+cargo run -p gridwake-server --example godot_psx_demo_server -- --bots 2000 --effects 350 --cover 900
 ```
 
 Open `examples/godot_psx_demo/project.godot` in Godot 4.7 and run the project.
 
-The server defaults to a conservative `--budget 700` and `--max-datagram 1200`
-before Gridwake has snapshot fragmentation. Larger budgets are useful for CPU
-stress tests, but oversized encoded datagrams are dropped by the demo transport.
+The server defaults to a conservative `--budget 700` and `--max-datagram 1200`.
+The demo transport splits oversized snapshot deltas into multiple UDP datagrams,
+which keeps initial joins and heavy destructive updates inside the datagram cap.
 
 Keyboard controls:
 
 - `W` / `S` or Up / Down: move forward/back
 - `A` / `D` or Left / Right: turn
 - `Q` / `E`: strafe
+- Space or Left Mouse: fire a server-applied blast into destructible cover
 
 For a lighter local smoke:
 
 ```sh
-cargo run -p gridwake-server --example godot_psx_demo_server -- --bots 200 --effects 40
+cargo run -p gridwake-server --example godot_psx_demo_server -- --bots 200 --effects 40 --cover 100
 godot --path examples/godot_psx_demo
 ```
 

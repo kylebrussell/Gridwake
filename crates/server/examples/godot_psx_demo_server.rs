@@ -10,6 +10,7 @@ use gridwake_protocol::{
     decode_client_message, encode_server_message, ClientMessage, RoutedClientMessage, ServerMessage,
 };
 use gridwake_server::{NetworkLod, NetworkLodPayloads, ServerConfig, ServerRuntime, Transport};
+use gridwake_snapshot::{DeltaOp, DeltaSnapshot};
 
 const RECV_BUFFER_BYTES: usize = 65_536;
 const CLIENT_INPUT_MAGIC: &[u8; 4] = b"GWCI";
@@ -18,6 +19,7 @@ const DEMO_PAYLOAD_MAGIC: &[u8; 4] = b"GWPD";
 const KIND_BOT: u8 = 0;
 const KIND_PLAYER: u8 = 1;
 const KIND_EFFECT: u8 = 2;
+const KIND_COVER: u8 = 3;
 
 const LOD_FULL: u8 = 0;
 const LOD_REDUCED: u8 = 1;
@@ -25,13 +27,23 @@ const LOD_MINIMAL: u8 = 2;
 
 const BOT_ENTITY_BASE: u64 = 1;
 const EFFECT_ENTITY_BASE: u64 = 2_000_000;
+const COVER_ENTITY_BASE: u64 = 4_000_000;
 const PLAYER_ENTITY_BASE: u64 = 10_000_000;
+
+const COVER_MAX_HEALTH: f32 = 100.0;
+const COVER_DAMAGE_RADIUS: f32 = 10.0;
+const COVER_DAMAGE_PER_HIT: f32 = 18.0;
+const COVER_DAMAGE_INTERVAL_TICKS: u64 = 4;
+const PLAYER_BLAST_RADIUS: f32 = 15.0;
+const PLAYER_BLAST_DAMAGE: f32 = 42.0;
+const PLAYER_FIRE_COOLDOWN_TICKS: u64 = 8;
 
 #[derive(Clone, Debug)]
 struct Args {
     bind: String,
     bots: u64,
     effects: u64,
+    cover: u64,
     tick_rate_hz: u16,
     world_size: f32,
     interest_radius: f32,
@@ -46,6 +58,7 @@ impl Default for Args {
             bind: "127.0.0.1:3456".to_owned(),
             bots: 2_000,
             effects: 350,
+            cover: 900,
             tick_rate_hz: 20,
             world_size: 512.0,
             interest_radius: 128.0,
@@ -105,16 +118,49 @@ impl DemoEntity {
 }
 
 #[derive(Clone, Debug)]
+struct DemoCover {
+    entity: EntityId,
+    position: Vec3,
+    radius: f32,
+    health: f32,
+    material: u8,
+}
+
+impl DemoCover {
+    fn health_ratio(&self) -> f32 {
+        (self.health / COVER_MAX_HEALTH).clamp(0.0, 1.0)
+    }
+
+    fn is_destroyed(&self) -> bool {
+        self.health <= 0.0
+    }
+
+    fn payloads(&self) -> NetworkLodPayloads {
+        payloads_for_entity(
+            KIND_COVER,
+            self.material,
+            self.position,
+            self.health_ratio(),
+            self.radius,
+            0.0,
+            cover_style(self.material, self.health_ratio()),
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
 struct ClientState {
     player_entity: EntityId,
     position: Vec3,
     yaw: f32,
+    next_fire_tick: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct ClientInput {
     position: Vec3,
     yaw: f32,
+    fire: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -214,25 +260,9 @@ impl Transport for DemoUdpTransport {
             return;
         };
 
-        match encode_server_message(&message) {
-            Ok(bytes) => {
-                if bytes.len() > self.max_datagram_bytes {
-                    self.oversized_datagrams = self.oversized_datagrams.saturating_add(1);
-                    if self.oversized_datagrams <= 3 || self.oversized_datagrams % 100 == 0 {
-                        eprintln!(
-                            "drop oversized datagram to client {} at {addr}: bytes={} max={}",
-                            client.raw(),
-                            bytes.len(),
-                            self.max_datagram_bytes
-                        );
-                    }
-                    return;
-                }
-                if let Err(error) = self.socket.send_to(&bytes, addr) {
-                    eprintln!("send error to client {} at {addr}: {error}", client.raw());
-                }
-            }
-            Err(error) => eprintln!("encode error for client {}: {error}", client.raw()),
+        match message {
+            ServerMessage::SnapshotDelta(delta) => self.send_snapshot_delta(client, addr, delta),
+            message => self.send_encoded_message(client, addr, &message),
         }
     }
 
@@ -247,6 +277,113 @@ impl Transport for DemoUdpTransport {
     }
 }
 
+impl DemoUdpTransport {
+    fn send_snapshot_delta(&mut self, client: ClientId, addr: SocketAddr, delta: DeltaSnapshot) {
+        match encode_server_message(&ServerMessage::SnapshotDelta(delta.clone())) {
+            Ok(bytes) if bytes.len() <= self.max_datagram_bytes => {
+                self.send_datagram(client, addr, bytes);
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("encode error for client {}: {error}", client.raw());
+                return;
+            }
+        }
+
+        let mut chunk = DeltaSnapshot::new(delta.sequence, delta.baseline, Vec::new());
+        for op in delta.ops {
+            chunk.ops.push(op);
+            match encode_server_message(&ServerMessage::SnapshotDelta(chunk.clone())) {
+                Ok(bytes) if bytes.len() <= self.max_datagram_bytes => continue,
+                Ok(_) => {
+                    let Some(oversized_op) = chunk.ops.pop() else {
+                        continue;
+                    };
+                    if !chunk.ops.is_empty() {
+                        let ops = std::mem::take(&mut chunk.ops);
+                        self.send_encoded_message(
+                            client,
+                            addr,
+                            &ServerMessage::SnapshotDelta(DeltaSnapshot::new(
+                                chunk.sequence,
+                                chunk.baseline,
+                                ops,
+                            )),
+                        );
+                    }
+                    self.queue_snapshot_op_or_drop(client, addr, &mut chunk, oversized_op);
+                }
+                Err(error) => {
+                    eprintln!("encode error for client {}: {error}", client.raw());
+                    chunk.ops.clear();
+                }
+            }
+        }
+
+        if !chunk.ops.is_empty() {
+            self.send_encoded_message(client, addr, &ServerMessage::SnapshotDelta(chunk));
+        }
+    }
+
+    fn queue_snapshot_op_or_drop(
+        &mut self,
+        client: ClientId,
+        addr: SocketAddr,
+        chunk: &mut DeltaSnapshot,
+        op: DeltaOp,
+    ) {
+        chunk.ops.push(op);
+        match encode_server_message(&ServerMessage::SnapshotDelta(chunk.clone())) {
+            Ok(bytes) if bytes.len() <= self.max_datagram_bytes => {}
+            Ok(bytes) => {
+                chunk.ops.clear();
+                self.log_oversized_datagram(client, addr, bytes.len());
+            }
+            Err(error) => {
+                chunk.ops.clear();
+                eprintln!("encode error for client {}: {error}", client.raw());
+            }
+        }
+    }
+
+    fn send_encoded_message(
+        &mut self,
+        client: ClientId,
+        addr: SocketAddr,
+        message: &ServerMessage,
+    ) {
+        match encode_server_message(message) {
+            Ok(bytes) => {
+                self.send_datagram(client, addr, bytes);
+            }
+            Err(error) => eprintln!("encode error for client {}: {error}", client.raw()),
+        }
+    }
+
+    fn send_datagram(&mut self, client: ClientId, addr: SocketAddr, bytes: Vec<u8>) {
+        if bytes.len() > self.max_datagram_bytes {
+            self.log_oversized_datagram(client, addr, bytes.len());
+            return;
+        }
+        if let Err(error) = self.socket.send_to(&bytes, addr) {
+            eprintln!("send error to client {} at {addr}: {error}", client.raw());
+        }
+    }
+
+    fn log_oversized_datagram(&mut self, client: ClientId, addr: SocketAddr, len: usize) {
+        self.oversized_datagrams = self.oversized_datagrams.saturating_add(1);
+        if self.oversized_datagrams <= 3 || self.oversized_datagrams % 100 == 0 {
+            eprintln!(
+                "drop oversized datagram to client {} at {addr}: bytes={} max={}",
+                client.raw(),
+                len,
+                self.max_datagram_bytes
+            );
+        }
+    }
+}
+
 fn main() -> io::Result<()> {
     let args = parse_args(env::args().skip(1))?;
     let mut runtime = ServerRuntime::new(ServerConfig {
@@ -258,13 +395,15 @@ fn main() -> io::Result<()> {
     });
     let mut transport = DemoUdpTransport::bind(&args.bind, args.max_datagram_bytes)?;
     let mut demo_entities = seed_demo_entities(&mut runtime, &args);
+    let mut covers = seed_demo_covers(&mut runtime, &args);
     let mut clients = HashMap::new();
 
     println!(
-        "gridwake Godot PSX demo server listening on {} bots={} effects={} tick_rate={} radius={} budget={} max_datagram={}",
+        "gridwake Godot PSX demo server listening on {} bots={} effects={} cover={} tick_rate={} radius={} budget={} max_datagram={}",
         transport.local_addr()?,
         args.bots,
         args.effects,
+        args.cover,
         args.tick_rate_hz,
         args.interest_radius,
         args.byte_budget,
@@ -274,19 +413,34 @@ fn main() -> io::Result<()> {
     let tick_interval = Duration::from_secs_f64(1.0 / f64::from(args.tick_rate_hz));
     let started = Instant::now();
     let mut next_tick = Instant::now();
+    let mut tick_count = 0_u64;
 
     loop {
-        handle_inbound(&mut runtime, &mut transport, &mut clients);
+        handle_inbound(
+            &mut runtime,
+            &mut transport,
+            &mut clients,
+            &mut covers,
+            tick_count,
+        );
 
         let now = Instant::now();
         if now >= next_tick {
+            tick_count = tick_count.saturating_add(1);
             let seconds = started.elapsed().as_secs_f32();
             update_demo_entities(&mut runtime, &mut demo_entities, seconds);
+            let world_events = update_destructible_world(
+                &mut runtime,
+                &demo_entities,
+                &mut covers,
+                seconds,
+                tick_count,
+            );
             let metrics = runtime.advance_tick(&mut transport);
 
             if metrics.tick.raw() % args.log_every_ticks == 0 {
                 println!(
-                    "tick={} clients={} entities={} aoi={} selected={} lod={}/{}/{} deferred={} bytes={} messages={}",
+                    "tick={} clients={} entities={} aoi={} selected={} lod={}/{}/{} deferred={} bytes={} messages={} cover_hits={} cover_destroyed={}",
                     metrics.tick.raw(),
                     metrics.clients,
                     metrics.entities,
@@ -297,7 +451,9 @@ fn main() -> io::Result<()> {
                     metrics.selected_minimal_lod_updates,
                     metrics.deferred_updates,
                     metrics.bytes_scheduled,
-                    metrics.messages_sent
+                    metrics.messages_sent,
+                    world_events.cover_hits,
+                    world_events.cover_destroyed
                 );
             }
 
@@ -311,10 +467,18 @@ fn main() -> io::Result<()> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct WorldEventStats {
+    cover_hits: usize,
+    cover_destroyed: usize,
+}
+
 fn handle_inbound(
     runtime: &mut ServerRuntime,
     transport: &mut DemoUdpTransport,
     clients: &mut HashMap<ClientId, ClientState>,
+    covers: &mut [DemoCover],
+    tick: u64,
 ) {
     for inbound in transport.drain_client_messages() {
         if inbound.newly_connected {
@@ -338,6 +502,22 @@ fn handle_inbound(
                             player_payload(LOD_REDUCED, input.position, input.yaw),
                             player_payload(LOD_MINIMAL, input.position, input.yaw),
                         );
+                        if input.fire && tick >= client.next_fire_tick {
+                            let forward = Vec3::new(input.yaw.sin(), 0.0, input.yaw.cos());
+                            let blast = Vec3::new(
+                                input.position.x + forward.x * 18.0,
+                                0.0,
+                                input.position.z + forward.z * 18.0,
+                            );
+                            damage_covers(
+                                runtime,
+                                covers,
+                                blast,
+                                PLAYER_BLAST_RADIUS,
+                                PLAYER_BLAST_DAMAGE,
+                            );
+                            client.next_fire_tick = tick.saturating_add(PLAYER_FIRE_COOLDOWN_TICKS);
+                        }
                     }
                 }
             }
@@ -370,6 +550,7 @@ fn connect_demo_client(
             player_entity,
             position: spawn,
             yaw: 0.0,
+            next_fire_tick: 0,
         },
     );
     println!(
@@ -414,6 +595,46 @@ fn seed_demo_entities(runtime: &mut ServerRuntime, args: &Args) -> Vec<DemoEntit
     entities
 }
 
+fn seed_demo_covers(runtime: &mut ServerRuntime, args: &Args) -> Vec<DemoCover> {
+    let mut covers = Vec::with_capacity(args.cover as usize);
+    let side = (args.cover as f32).sqrt().ceil() as u64;
+    if side == 0 {
+        return covers;
+    }
+
+    let spacing = (args.world_size / side as f32).max(6.0);
+    let origin = -args.world_size * 0.5 + spacing * 0.5;
+    for index in 0..args.cover {
+        let x = index % side;
+        let z = index / side;
+        let offset_x = (hash_unit(index.wrapping_mul(41)) - 0.5) * spacing * 0.35;
+        let offset_z = (hash_unit(index.wrapping_mul(59)) - 0.5) * spacing * 0.35;
+        let position = Vec3::new(
+            origin + x as f32 * spacing + offset_x,
+            0.0,
+            origin + z as f32 * spacing + offset_z,
+        );
+        let material = (index % 4) as u8;
+        let radius = 1.6 + hash_unit(index.wrapping_mul(83)) * 1.4;
+        let cover = DemoCover {
+            entity: EntityId::new(COVER_ENTITY_BASE + index),
+            position,
+            radius,
+            health: COVER_MAX_HEALTH,
+            material,
+        };
+        runtime.spawn_entity_with_lod_payloads(
+            cover.entity,
+            cover.position,
+            cover.payloads(),
+            2.0,
+            NetworkLod::Full,
+        );
+        covers.push(cover);
+    }
+    covers
+}
+
 fn update_demo_entities(runtime: &mut ServerRuntime, entities: &mut [DemoEntity], seconds: f32) {
     for entity in entities {
         let position = entity.position_at(seconds);
@@ -426,6 +647,87 @@ fn update_demo_entities(runtime: &mut ServerRuntime, entities: &mut [DemoEntity]
             payloads.minimal,
         );
     }
+}
+
+fn update_destructible_world(
+    runtime: &mut ServerRuntime,
+    emitters: &[DemoEntity],
+    covers: &mut [DemoCover],
+    seconds: f32,
+    tick: u64,
+) -> WorldEventStats {
+    if tick % COVER_DAMAGE_INTERVAL_TICKS != 0 {
+        return WorldEventStats::default();
+    }
+
+    let mut stats = WorldEventStats::default();
+    for (emitter_index, emitter) in emitters
+        .iter()
+        .filter(|entity| entity.kind == KIND_EFFECT)
+        .enumerate()
+    {
+        if (tick / COVER_DAMAGE_INTERVAL_TICKS + emitter_index as u64) % 9 != 0 {
+            continue;
+        }
+
+        let blast = emitter.position_at(seconds);
+        stats += damage_covers(
+            runtime,
+            covers,
+            blast,
+            COVER_DAMAGE_RADIUS,
+            COVER_DAMAGE_PER_HIT,
+        );
+    }
+
+    stats
+}
+
+impl std::ops::AddAssign for WorldEventStats {
+    fn add_assign(&mut self, rhs: Self) {
+        self.cover_hits += rhs.cover_hits;
+        self.cover_destroyed += rhs.cover_destroyed;
+    }
+}
+
+fn damage_covers(
+    runtime: &mut ServerRuntime,
+    covers: &mut [DemoCover],
+    center: Vec3,
+    radius: f32,
+    damage_amount: f32,
+) -> WorldEventStats {
+    let mut stats = WorldEventStats::default();
+    let radius_squared = radius * radius;
+    for cover in covers.iter_mut() {
+        if cover.is_destroyed() {
+            continue;
+        }
+        let distance_squared = distance_squared_xz(center, cover.position);
+        if distance_squared > radius_squared {
+            continue;
+        }
+
+        let falloff = 1.0 - (distance_squared / radius_squared).sqrt();
+        let damage = damage_amount * falloff.max(0.15);
+        let previous_health = cover.health;
+        cover.health = (cover.health - damage).max(0.0);
+        if cover.health < previous_health {
+            stats.cover_hits += 1;
+            if previous_health > 0.0 && cover.is_destroyed() {
+                stats.cover_destroyed += 1;
+            }
+            let payloads = cover.payloads();
+            runtime.set_entity_lod_payloads(
+                cover.entity,
+                payloads.full,
+                payloads.reduced,
+                payloads.minimal,
+            );
+        }
+    }
+
+    stats
 }
 
 fn demo_entity(raw_entity: u64, kind: u8, index: u64, world_size: f32) -> DemoEntity {
@@ -512,6 +814,19 @@ fn player_payload(lod: u8, position: Vec3, yaw: f32) -> Vec<u8> {
     })
 }
 
+fn cover_style(material: u8, health_ratio: f32) -> u32 {
+    let stage = if health_ratio <= 0.0 {
+        3
+    } else if health_ratio < 0.35 {
+        2
+    } else if health_ratio < 0.7 {
+        1
+    } else {
+        0
+    };
+    u32::from(material) | ((stage as u32) << 8)
+}
+
 fn encode_demo_payload(payload: DemoPayload) -> Vec<u8> {
     let mut out = Vec::with_capacity(match payload.lod {
         LOD_FULL => 36,
@@ -539,7 +854,11 @@ fn encode_demo_payload(payload: DemoPayload) -> Vec<u8> {
 }
 
 fn parse_client_input(payload: &[u8]) -> Option<ClientInput> {
-    if payload.len() < 21 || &payload[0..4] != CLIENT_INPUT_MAGIC || payload[4] != 1 {
+    if payload.len() < 21 || &payload[0..4] != CLIENT_INPUT_MAGIC {
+        return None;
+    }
+    let version = payload[4];
+    if version != 1 && version != 2 {
         return None;
     }
     Some(ClientInput {
@@ -549,6 +868,7 @@ fn parse_client_input(payload: &[u8]) -> Option<ClientInput> {
             read_f32(payload, 13)?,
         ),
         yaw: read_f32(payload, 17)?,
+        fire: version >= 2 && payload.get(21).copied().unwrap_or(0) & 1 != 0,
     })
 }
 
@@ -572,6 +892,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> io::Result<Args> {
             "--bind" => parsed.bind = value,
             "--bots" => parsed.bots = parse_positive(&arg, &value)?,
             "--effects" => parsed.effects = parse_positive(&arg, &value)?,
+            "--cover" => parsed.cover = parse_positive(&arg, &value)?,
             "--tick-rate" => parsed.tick_rate_hz = parse_positive(&arg, &value)?,
             "--world-size" => parsed.world_size = parse_positive_f32(&arg, &value)?,
             "--radius" => parsed.interest_radius = parse_positive_f32(&arg, &value)?,
@@ -586,7 +907,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> io::Result<Args> {
 
 fn print_usage() {
     eprintln!(
-        "usage: cargo run -p gridwake-server --example godot_psx_demo_server -- [--bind 127.0.0.1:3456] [--bots N] [--effects N] [--tick-rate HZ] [--world-size N] [--radius N] [--budget BYTES] [--max-datagram BYTES] [--log-every TICKS]"
+        "usage: cargo run -p gridwake-server --example godot_psx_demo_server -- [--bind 127.0.0.1:3456] [--bots N] [--effects N] [--cover N] [--tick-rate HZ] [--world-size N] [--radius N] [--budget BYTES] [--max-datagram BYTES] [--log-every TICKS]"
     );
 }
 
@@ -625,6 +946,12 @@ fn read_f32(bytes: &[u8], offset: usize) -> Option<f32> {
     Some(f32::from_le_bytes(
         bytes.get(offset..offset + 4)?.try_into().ok()?,
     ))
+}
+
+fn distance_squared_xz(left: Vec3, right: Vec3) -> f32 {
+    let dx = left.x - right.x;
+    let dz = left.z - right.z;
+    dx.mul_add(dx, dz * dz)
 }
 
 fn hash_unit(value: u64) -> f32 {

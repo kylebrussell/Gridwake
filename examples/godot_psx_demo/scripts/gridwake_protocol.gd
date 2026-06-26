@@ -19,20 +19,25 @@ const DEMO_PAYLOAD_MAGIC := "GWPD"
 const KIND_BOT := 0
 const KIND_PLAYER := 1
 const KIND_EFFECT := 2
+const KIND_COVER := 3
 
 const LOD_FULL := 0
 const LOD_REDUCED := 1
 const LOD_MINIMAL := 2
 
-static func encode_input(position: Vector3, yaw: float) -> PackedByteArray:
+static func encode_input(position: Vector3, yaw: float, fire: bool = false) -> PackedByteArray:
 	var payload := StreamPeerBuffer.new()
 	payload.big_endian = false
 	payload.put_data(CLIENT_INPUT_MAGIC.to_ascii_buffer())
-	payload.put_u8(1)
+	payload.put_u8(2)
 	payload.put_float(position.x)
 	payload.put_float(position.y)
 	payload.put_float(position.z)
 	payload.put_float(yaw)
+	var flags := 0
+	if fire:
+		flags |= 1
+	payload.put_u8(flags)
 	return _encode_client_payload(TAG_CLIENT_INPUT, payload.data_array)
 
 

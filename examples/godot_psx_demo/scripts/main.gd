@@ -22,9 +22,13 @@ var last_server_error := ""
 var bot_mesh: BoxMesh
 var player_mesh: BoxMesh
 var effect_mesh: SphereMesh
+var cover_mesh: BoxMesh
 var materials: Dictionary = {}
 var camera: Camera3D
 var hud: Label
+var cover_nodes: Dictionary = {}
+var damaged_cover_nodes: Dictionary = {}
+var ruined_cover_nodes: Dictionary = {}
 
 func _ready() -> void:
 	_setup_rendering()
@@ -79,6 +83,8 @@ func _setup_world() -> void:
 	effect_mesh.rings = 4
 	effect_mesh.radius = 0.65
 	effect_mesh.height = 1.3
+	cover_mesh = BoxMesh.new()
+	cover_mesh.size = Vector3.ONE
 
 	_create_materials()
 	_create_floor()
@@ -101,6 +107,12 @@ func _create_materials() -> void:
 	materials["player"] = _material(Color(0.75, 1.0, 0.72))
 	materials["effect"] = _material(Color(0.98, 0.42, 0.92))
 	materials["minimal"] = _material(Color(0.52, 0.57, 0.66))
+	materials["cover_0"] = _material(Color(0.43, 0.48, 0.50))
+	materials["cover_1"] = _material(Color(0.50, 0.41, 0.34))
+	materials["cover_2"] = _material(Color(0.34, 0.42, 0.34))
+	materials["cover_3"] = _material(Color(0.45, 0.37, 0.48))
+	materials["cover_damaged"] = _material(Color(0.72, 0.48, 0.28))
+	materials["cover_ruined"] = _material(Color(0.16, 0.15, 0.15))
 	materials["floor"] = _material(Color(0.13, 0.16, 0.18))
 	materials["grid"] = _material(Color(0.22, 0.28, 0.32))
 
@@ -214,6 +226,10 @@ func _upsert_entity(entity: int, payload: Dictionary) -> void:
 	else:
 		return
 
+	if int(payload["kind"]) == GridwakeProtocol.KIND_COVER:
+		_update_cover_node(entity, node, payload)
+		return
+
 	node.position = payload["position"]
 	node.rotation.y = payload["yaw"]
 	var radius := float(payload["radius"])
@@ -229,9 +245,31 @@ func _create_entity_node(payload: Dictionary) -> MeshInstance3D:
 			node.mesh = player_mesh
 		GridwakeProtocol.KIND_EFFECT:
 			node.mesh = effect_mesh
+		GridwakeProtocol.KIND_COVER:
+			node.mesh = cover_mesh
 		_:
 			node.mesh = bot_mesh
 	return node
+
+
+func _update_cover_node(entity: int, node: MeshInstance3D, payload: Dictionary) -> void:
+	var health := _cover_health(payload)
+	var radius := float(payload["radius"])
+	var height := lerpf(0.22, 3.4, max(health, 0.08))
+	var position: Vector3 = payload["position"]
+	node.position = Vector3(position.x, height * 0.5 - 0.06, position.z)
+	node.rotation.y = 0.0
+	node.scale = Vector3(radius * 1.8, height, radius * 1.8)
+	node.material_override = _material_for_payload(payload)
+	cover_nodes[entity] = true
+	if health < 0.7:
+		damaged_cover_nodes[entity] = true
+	else:
+		damaged_cover_nodes.erase(entity)
+	if health <= 0.05:
+		ruined_cover_nodes[entity] = true
+	else:
+		ruined_cover_nodes.erase(entity)
 
 
 func _remove_entity(entity: int) -> void:
@@ -239,6 +277,9 @@ func _remove_entity(entity: int) -> void:
 		return
 	var node: Node = entity_nodes[entity]
 	entity_nodes.erase(entity)
+	cover_nodes.erase(entity)
+	damaged_cover_nodes.erase(entity)
+	ruined_cover_nodes.erase(entity)
 	node.queue_free()
 
 
@@ -250,6 +291,13 @@ func _material_for_payload(payload: Dictionary) -> StandardMaterial3D:
 			return materials["player"]
 		GridwakeProtocol.KIND_EFFECT:
 			return materials["effect"]
+		GridwakeProtocol.KIND_COVER:
+			var health := _cover_health(payload)
+			if health <= 0.05:
+				return materials["cover_ruined"]
+			if health < 0.7:
+				return materials["cover_damaged"]
+			return materials["cover_%d" % int(payload["team"] % 4)]
 		_:
 			return materials["bot_%d" % int(payload["team"] % 3)]
 
@@ -264,8 +312,16 @@ func _lod_scale(lod: int) -> float:
 			return 0.65
 
 
+func _cover_health(payload: Dictionary) -> float:
+	return clampf(float(payload["yaw"]), 0.0, 1.0)
+
+
 func _send_input() -> void:
-	udp.put_packet(GridwakeProtocol.encode_input(player_position, player_yaw))
+	udp.put_packet(GridwakeProtocol.encode_input(player_position, player_yaw, _fire_pressed()))
+
+
+func _fire_pressed() -> bool:
+	return Input.is_key_pressed(KEY_SPACE) or Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)
 
 
 func _update_camera() -> void:
@@ -275,11 +331,14 @@ func _update_camera() -> void:
 
 
 func _update_hud() -> void:
-	hud.text = "Gridwake Godot Demo\nserver %s:%d\nvisible %d / cap %d\nsnapshot %d packets %d ops %d\n%s" % [
+	hud.text = "Gridwake Godot Demo\nserver %s:%d\nvisible %d / cap %d\ncover %d damaged %d ruined %d\nsnapshot %d packets %d ops %d\n%s" % [
 		server_host,
 		server_port,
 		entity_nodes.size(),
 		max_visual_entities,
+		cover_nodes.size(),
+		damaged_cover_nodes.size(),
+		ruined_cover_nodes.size(),
 		snapshot_sequence,
 		packets_received,
 		ops_received,
