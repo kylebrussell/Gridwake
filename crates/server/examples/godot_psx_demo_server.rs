@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::io::{self, ErrorKind};
 use std::net::{SocketAddr, UdpSocket};
@@ -21,6 +21,7 @@ const KIND_BOT: u8 = 0;
 const KIND_PLAYER: u8 = 1;
 const KIND_EFFECT: u8 = 2;
 const KIND_COVER: u8 = 3;
+const KIND_IMPACT: u8 = 4;
 
 const LOD_FULL: u8 = 0;
 const LOD_REDUCED: u8 = 1;
@@ -29,6 +30,7 @@ const LOD_MINIMAL: u8 = 2;
 const BOT_ENTITY_BASE: u64 = 1;
 const EFFECT_ENTITY_BASE: u64 = 2_000_000;
 const COVER_ENTITY_BASE: u64 = 4_000_000;
+const IMPACT_ENTITY_BASE: u64 = 6_000_000;
 const PLAYER_ENTITY_BASE: u64 = 10_000_000;
 
 const COVER_MAX_HEALTH: f32 = 100.0;
@@ -39,6 +41,9 @@ const PLAYER_BLAST_RADIUS: f32 = 15.0;
 const PLAYER_BLAST_DAMAGE: f32 = 42.0;
 const PLAYER_FIRE_COOLDOWN_TICKS: u64 = 8;
 const COVER_INDEX_CELL_SIZE: f32 = 16.0;
+const IMPACT_LIFETIME_TICKS: u64 = 18;
+const MAX_ACTIVE_IMPACTS: usize = 512;
+const MAX_PORTABLE_UDP_PAYLOAD_BYTES: usize = 8_192;
 
 #[derive(Clone, Debug)]
 struct Args {
@@ -259,6 +264,35 @@ impl DemoCover {
 }
 
 #[derive(Clone, Debug)]
+struct DemoImpact {
+    entity: EntityId,
+    position: Vec3,
+    radius: f32,
+    style: u32,
+    spawned_tick: u64,
+    expires_tick: u64,
+}
+
+impl DemoImpact {
+    fn phase(&self, tick: u64) -> f32 {
+        let elapsed = tick.saturating_sub(self.spawned_tick) as f32;
+        (elapsed / IMPACT_LIFETIME_TICKS as f32).clamp(0.0, 1.0)
+    }
+
+    fn payloads(&self, tick: u64) -> NetworkLodPayloads {
+        payloads_for_entity(
+            KIND_IMPACT,
+            (self.style % 4) as u8,
+            self.position,
+            0.0,
+            self.radius,
+            self.phase(tick),
+            self.style,
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
 struct ClientState {
     player_entity: EntityId,
     position: Vec3,
@@ -301,6 +335,7 @@ struct DemoUdpTransport {
     recv_buffer: Vec<u8>,
     max_datagram_bytes: usize,
     oversized_datagrams: u64,
+    send_errors: u64,
     datagrams_sent: u64,
     bytes_sent: u64,
     snapshot_fragments_sent: u64,
@@ -310,14 +345,22 @@ impl DemoUdpTransport {
     fn bind(addr: &str, max_datagram_bytes: usize) -> io::Result<Self> {
         let socket = UdpSocket::bind(addr)?;
         socket.set_nonblocking(true)?;
+        let effective_max_datagram_bytes = max_datagram_bytes.min(MAX_PORTABLE_UDP_PAYLOAD_BYTES);
+        if effective_max_datagram_bytes < max_datagram_bytes {
+            eprintln!(
+                "clamp max_datagram from {} to {} for portable UDP payloads",
+                max_datagram_bytes, effective_max_datagram_bytes
+            );
+        }
         Ok(Self {
             socket,
             clients: HashMap::new(),
             peers: HashMap::new(),
             next_client: 1,
             recv_buffer: vec![0; RECV_BUFFER_BYTES],
-            max_datagram_bytes,
+            max_datagram_bytes: effective_max_datagram_bytes,
             oversized_datagrams: 0,
+            send_errors: 0,
             datagrams_sent: 0,
             bytes_sent: 0,
             snapshot_fragments_sent: 0,
@@ -503,10 +546,24 @@ impl DemoUdpTransport {
             self.log_oversized_datagram(client, addr, bytes.len());
             return;
         }
-        self.datagrams_sent = self.datagrams_sent.saturating_add(1);
-        self.bytes_sent = self.bytes_sent.saturating_add(bytes.len() as u64);
-        if let Err(error) = self.socket.send_to(&bytes, addr) {
-            eprintln!("send error to client {} at {addr}: {error}", client.raw());
+        match self.socket.send_to(&bytes, addr) {
+            Ok(_) => {
+                self.datagrams_sent = self.datagrams_sent.saturating_add(1);
+                self.bytes_sent = self.bytes_sent.saturating_add(bytes.len() as u64);
+            }
+            Err(error) => self.log_send_error(client, addr, bytes.len(), error),
+        }
+    }
+
+    fn log_send_error(&mut self, client: ClientId, addr: SocketAddr, len: usize, error: io::Error) {
+        self.send_errors = self.send_errors.saturating_add(1);
+        if self.send_errors <= 3 || self.send_errors % 100 == 0 {
+            eprintln!(
+                "send error to client {} at {addr}: bytes={} error={}",
+                client.raw(),
+                len,
+                error
+            );
         }
     }
 
@@ -563,6 +620,8 @@ fn main() -> io::Result<()> {
     let mut covers = seed_demo_covers(&mut runtime, &args);
     let cover_index = CoverIndex::new(&covers, COVER_INDEX_CELL_SIZE);
     let mut cover_candidates = Vec::new();
+    let mut impacts = VecDeque::new();
+    let mut next_impact_id = 0_u64;
     let mut clients = HashMap::new();
     let mut perf_totals = PerfTotals::default();
 
@@ -575,7 +634,7 @@ fn main() -> io::Result<()> {
         args.tick_rate_hz,
         args.interest_radius,
         args.byte_budget,
-        args.max_datagram_bytes,
+        transport.max_datagram_bytes,
         args.run_ticks
             .map(|ticks| ticks.to_string())
             .unwrap_or_else(|| "infinite".to_owned())
@@ -587,15 +646,22 @@ fn main() -> io::Result<()> {
     let mut tick_count = 0_u64;
 
     loop {
-        handle_inbound(
-            &mut runtime,
-            &mut transport,
-            &mut clients,
-            &mut covers,
-            &cover_index,
-            &mut cover_candidates,
-            tick_count,
-        );
+        {
+            let mut world = WorldInteractionState {
+                covers: &mut covers,
+                cover_index: &cover_index,
+                cover_candidates: &mut cover_candidates,
+                impacts: &mut impacts,
+                next_impact_id: &mut next_impact_id,
+            };
+            handle_inbound(
+                &mut runtime,
+                &mut transport,
+                &mut clients,
+                &mut world,
+                tick_count,
+            );
+        }
 
         let now = Instant::now();
         if now >= next_tick {
@@ -606,15 +672,23 @@ fn main() -> io::Result<()> {
             update_demo_entities(&mut runtime, &mut demo_entities, seconds);
             let update_micros = update_started.elapsed().as_micros();
             let world_started = Instant::now();
-            let world_events = update_destructible_world(
-                &mut runtime,
-                &demo_entities,
-                &mut covers,
-                &cover_index,
-                &mut cover_candidates,
-                seconds,
-                tick_count,
-            );
+            let world_events = {
+                let mut world = WorldInteractionState {
+                    covers: &mut covers,
+                    cover_index: &cover_index,
+                    cover_candidates: &mut cover_candidates,
+                    impacts: &mut impacts,
+                    next_impact_id: &mut next_impact_id,
+                };
+                update_destructible_world(
+                    &mut runtime,
+                    &demo_entities,
+                    &mut world,
+                    seconds,
+                    tick_count,
+                )
+            };
+            update_impacts(&mut runtime, &mut impacts, tick_count);
             let world_micros = world_started.elapsed().as_micros();
             let runtime_started = Instant::now();
             let metrics = runtime.advance_tick(&mut transport);
@@ -629,7 +703,7 @@ fn main() -> io::Result<()> {
 
             if metrics.tick.raw() % args.log_every_ticks == 0 {
                 println!(
-                    "tick={} clients={} entities={} aoi={} selected={} lod={}/{}/{} deferred={} bytes={} messages={} cover_hits={} cover_destroyed={} ms={:.3}/{:.3}/{:.3}/{:.3} datagrams={} net_bytes={} fragments={}",
+                    "tick={} clients={} entities={} aoi={} selected={} lod={}/{}/{} deferred={} bytes={} messages={} cover_hits={} cover_destroyed={} impacts={} active_impacts={} ms={:.3}/{:.3}/{:.3}/{:.3} datagrams={} net_bytes={} fragments={} send_errors={}",
                     metrics.tick.raw(),
                     metrics.clients,
                     metrics.entities,
@@ -643,13 +717,16 @@ fn main() -> io::Result<()> {
                     metrics.messages_sent,
                     world_events.cover_hits,
                     world_events.cover_destroyed,
+                    world_events.impacts_spawned,
+                    impacts.len(),
                     sample.tick_micros as f64 / 1_000.0,
                     sample.update_micros as f64 / 1_000.0,
                     sample.world_micros as f64 / 1_000.0,
                     sample.runtime_micros as f64 / 1_000.0,
                     transport.datagrams_sent,
                     transport.bytes_sent,
-                    transport.snapshot_fragments_sent
+                    transport.snapshot_fragments_sent,
+                    transport.send_errors
                 );
             }
 
@@ -658,7 +735,7 @@ fn main() -> io::Result<()> {
                 .is_some_and(|run_ticks| tick_count >= run_ticks)
             {
                 println!(
-                    "summary ticks={} avg_tick_ms={:.3} max_tick_ms={:.3} avg_update_ms={:.3} avg_world_ms={:.3} avg_runtime_ms={:.3} datagrams={} net_bytes={} fragments={} oversized={}",
+                    "summary ticks={} avg_tick_ms={:.3} max_tick_ms={:.3} avg_update_ms={:.3} avg_world_ms={:.3} avg_runtime_ms={:.3} datagrams={} net_bytes={} fragments={} oversized={} send_errors={}",
                     perf_totals.ticks,
                     perf_totals.avg_tick_ms(),
                     perf_totals.max_tick_ms(),
@@ -668,7 +745,8 @@ fn main() -> io::Result<()> {
                     transport.datagrams_sent,
                     transport.bytes_sent,
                     transport.snapshot_fragments_sent,
-                    transport.oversized_datagrams
+                    transport.oversized_datagrams,
+                    transport.send_errors
                 );
                 return Ok(());
             }
@@ -687,15 +765,22 @@ fn main() -> io::Result<()> {
 struct WorldEventStats {
     cover_hits: usize,
     cover_destroyed: usize,
+    impacts_spawned: usize,
+}
+
+struct WorldInteractionState<'a> {
+    covers: &'a mut [DemoCover],
+    cover_index: &'a CoverIndex,
+    cover_candidates: &'a mut Vec<usize>,
+    impacts: &'a mut VecDeque<DemoImpact>,
+    next_impact_id: &'a mut u64,
 }
 
 fn handle_inbound(
     runtime: &mut ServerRuntime,
     transport: &mut DemoUdpTransport,
     clients: &mut HashMap<ClientId, ClientState>,
-    covers: &mut [DemoCover],
-    cover_index: &CoverIndex,
-    cover_candidates: &mut Vec<usize>,
+    world: &mut WorldInteractionState<'_>,
     tick: u64,
 ) {
     for inbound in transport.drain_client_messages() {
@@ -727,14 +812,23 @@ fn handle_inbound(
                                 0.0,
                                 input.position.z + forward.z * 18.0,
                             );
-                            damage_covers(
+                            let impact_events = damage_covers(
                                 runtime,
-                                covers,
-                                cover_index,
-                                cover_candidates,
+                                &mut *world.covers,
+                                world.cover_index,
+                                &mut *world.cover_candidates,
                                 blast,
                                 PLAYER_BLAST_RADIUS,
                                 PLAYER_BLAST_DAMAGE,
+                            );
+                            spawn_impact(
+                                runtime,
+                                &mut *world.impacts,
+                                &mut *world.next_impact_id,
+                                blast,
+                                PLAYER_BLAST_RADIUS,
+                                11 + impact_events.cover_hits as u32,
+                                tick,
                             );
                             client.next_fire_tick = tick.saturating_add(PLAYER_FIRE_COOLDOWN_TICKS);
                         }
@@ -866,9 +960,7 @@ fn update_demo_entities(runtime: &mut ServerRuntime, entities: &mut [DemoEntity]
 fn update_destructible_world(
     runtime: &mut ServerRuntime,
     emitters: &[DemoEntity],
-    covers: &mut [DemoCover],
-    cover_index: &CoverIndex,
-    cover_candidates: &mut Vec<usize>,
+    world: &mut WorldInteractionState<'_>,
     seconds: f32,
     tick: u64,
 ) -> WorldEventStats {
@@ -887,15 +979,28 @@ fn update_destructible_world(
         }
 
         let blast = emitter.position_at(seconds);
-        stats += damage_covers(
+        let events = damage_covers(
             runtime,
-            covers,
-            cover_index,
-            cover_candidates,
+            &mut *world.covers,
+            world.cover_index,
+            &mut *world.cover_candidates,
             blast,
             COVER_DAMAGE_RADIUS,
             COVER_DAMAGE_PER_HIT,
         );
+        if events.cover_hits > 0 {
+            spawn_impact(
+                runtime,
+                &mut *world.impacts,
+                &mut *world.next_impact_id,
+                blast,
+                COVER_DAMAGE_RADIUS,
+                emitter.style,
+                tick,
+            );
+            stats.impacts_spawned += 1;
+        }
+        stats += events;
     }
 
     stats
@@ -905,6 +1010,67 @@ impl std::ops::AddAssign for WorldEventStats {
     fn add_assign(&mut self, rhs: Self) {
         self.cover_hits += rhs.cover_hits;
         self.cover_destroyed += rhs.cover_destroyed;
+        self.impacts_spawned += rhs.impacts_spawned;
+    }
+}
+
+fn spawn_impact(
+    runtime: &mut ServerRuntime,
+    impacts: &mut VecDeque<DemoImpact>,
+    next_impact_id: &mut u64,
+    center: Vec3,
+    radius: f32,
+    style: u32,
+    tick: u64,
+) {
+    while impacts.len() >= MAX_ACTIVE_IMPACTS {
+        let Some(expired) = impacts.pop_front() else {
+            break;
+        };
+        runtime.despawn_entity(expired.entity);
+    }
+
+    let entity = EntityId::new(IMPACT_ENTITY_BASE + *next_impact_id);
+    *next_impact_id = (*next_impact_id).saturating_add(1);
+    let position = Vec3::new(center.x, 0.35, center.z);
+    let impact = DemoImpact {
+        entity,
+        position,
+        radius,
+        style,
+        spawned_tick: tick,
+        expires_tick: tick.saturating_add(IMPACT_LIFETIME_TICKS),
+    };
+    runtime.spawn_entity_with_lod_payloads(
+        impact.entity,
+        impact.position,
+        impact.payloads(tick),
+        radius,
+        NetworkLod::Full,
+    );
+    impacts.push_back(impact);
+}
+
+fn update_impacts(runtime: &mut ServerRuntime, impacts: &mut VecDeque<DemoImpact>, tick: u64) {
+    let mut index = 0;
+    while index < impacts.len() {
+        if tick >= impacts[index].expires_tick {
+            let Some(expired) = impacts.remove(index) else {
+                break;
+            };
+            runtime.despawn_entity(expired.entity);
+            continue;
+        }
+
+        let impact = &impacts[index];
+        let payloads = impact.payloads(tick);
+        runtime.set_entity_lod_payloads(
+            impact.entity,
+            payloads.full,
+            payloads.reduced,
+            payloads.minimal,
+        );
+        index += 1;
     }
 }
 

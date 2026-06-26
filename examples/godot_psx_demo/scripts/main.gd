@@ -9,6 +9,7 @@ const GridwakeProtocol := preload("res://scripts/gridwake_protocol.gd")
 @export var turn_speed := 2.4
 @export var max_visual_entities := 6000
 @export var max_packets_per_frame := 32
+@export var max_pending_fragment_sequences := 8
 @export var perf_sample_hz := 4.0
 @export var perf_log_hz := 1.0
 @export var perf_log_enabled := true
@@ -31,6 +32,7 @@ var fragments_received := 0
 var fragments_completed := 0
 var last_server_error := ""
 var snapshot_fragments: Dictionary = {}
+var fragment_sequence_order: Array[String] = []
 var perf_sample_accumulator := 0.0
 var perf_log_accumulator := 0.0
 var perf_last_sample_msec := 0
@@ -56,13 +58,16 @@ var perf_fragments_per_sec := 0.0
 var bot_mesh: BoxMesh
 var player_mesh: BoxMesh
 var effect_mesh: SphereMesh
+var impact_mesh: SphereMesh
 var cover_mesh: BoxMesh
+var prop_mesh: BoxMesh
 var materials: Dictionary = {}
 var camera: Camera3D
 var hud: Label
 var cover_nodes: Dictionary = {}
 var damaged_cover_nodes: Dictionary = {}
 var ruined_cover_nodes: Dictionary = {}
+var impact_nodes: Dictionary = {}
 
 func _ready() -> void:
 	_setup_rendering()
@@ -120,11 +125,19 @@ func _setup_world() -> void:
 	effect_mesh.rings = 4
 	effect_mesh.radius = 0.65
 	effect_mesh.height = 1.3
+	impact_mesh = SphereMesh.new()
+	impact_mesh.radial_segments = 8
+	impact_mesh.rings = 4
+	impact_mesh.radius = 1.0
+	impact_mesh.height = 2.0
 	cover_mesh = BoxMesh.new()
 	cover_mesh.size = Vector3.ONE
+	prop_mesh = BoxMesh.new()
+	prop_mesh.size = Vector3.ONE
 
 	_create_materials()
 	_create_floor()
+	_create_arena_props()
 
 	var canvas := CanvasLayer.new()
 	hud = Label.new()
@@ -143,6 +156,7 @@ func _create_materials() -> void:
 	materials["bot_2"] = _material(Color(0.95, 0.82, 0.22))
 	materials["player"] = _material(Color(0.75, 1.0, 0.72))
 	materials["effect"] = _material(Color(0.98, 0.42, 0.92))
+	materials["impact"] = _material(Color(1.0, 0.74, 0.30))
 	materials["minimal"] = _material(Color(0.52, 0.57, 0.66))
 	materials["cover_0"] = _material(Color(0.43, 0.48, 0.50))
 	materials["cover_1"] = _material(Color(0.50, 0.41, 0.34))
@@ -152,6 +166,10 @@ func _create_materials() -> void:
 	materials["cover_ruined"] = _material(Color(0.16, 0.15, 0.15))
 	materials["floor"] = _material(Color(0.13, 0.16, 0.18))
 	materials["grid"] = _material(Color(0.22, 0.28, 0.32))
+	materials["prop_wall"] = _material(Color(0.38, 0.43, 0.48))
+	materials["prop_trim"] = _material(Color(0.14, 0.52, 0.56))
+	materials["prop_signal"] = _material(Color(0.92, 0.72, 0.26))
+	materials["prop_barrel"] = _material(Color(0.62, 0.18, 0.20))
 
 
 func _material(color: Color) -> StandardMaterial3D:
@@ -186,6 +204,61 @@ func _create_floor() -> void:
 		x_line.rotation_degrees.y = 90.0
 		x_line.position = Vector3(float(index) * 32.0, 0.03, 0.0)
 		add_child(x_line)
+
+
+func _create_arena_props() -> void:
+	var walls: Array[Transform3D] = []
+	var trim: Array[Transform3D] = []
+	var signal_props: Array[Transform3D] = []
+	var barrels: Array[Transform3D] = []
+
+	for lane in range(-4, 5):
+		var x := float(lane) * 18.0
+		walls.append(_box_transform(Vector3(x, 1.4, -74.0), Vector3(10.0, 2.8, 2.2), 0.0))
+		walls.append(_box_transform(Vector3(x, 1.4, 74.0), Vector3(10.0, 2.8, 2.2), 0.0))
+		if lane % 2 == 0:
+			trim.append(_box_transform(Vector3(-82.0, 2.8, x), Vector3(2.0, 5.6, 8.0), 0.0))
+			trim.append(_box_transform(Vector3(82.0, 2.8, x), Vector3(2.0, 5.6, 8.0), 0.0))
+
+	for index in range(18):
+		var angle := float(index) * TAU / 18.0
+		var radius := 34.0 + float(index % 3) * 15.0
+		var position := Vector3(cos(angle) * radius, 0.85, sin(angle) * radius)
+		barrels.append(_box_transform(position, Vector3(2.1, 1.7, 2.1), angle))
+
+	for corner_x in [-54.0, 54.0]:
+		for corner_z in [-54.0, 54.0]:
+			signal_props.append(_box_transform(Vector3(corner_x, 4.2, corner_z), Vector3(4.0, 8.4, 4.0), 0.0))
+			trim.append(_box_transform(Vector3(corner_x, 8.8, corner_z), Vector3(6.0, 0.8, 6.0), 0.0))
+
+	_create_static_prop_bucket("prop_wall", walls)
+	_create_static_prop_bucket("prop_trim", trim)
+	_create_static_prop_bucket("prop_signal", signal_props)
+	_create_static_prop_bucket("prop_barrel", barrels)
+
+
+func _box_transform(position: Vector3, size: Vector3, yaw: float) -> Transform3D:
+	var basis := Basis(Vector3.UP, yaw)
+	basis = basis.scaled(size)
+	return Transform3D(basis, position)
+
+
+func _create_static_prop_bucket(material_key: String, transforms: Array[Transform3D]) -> void:
+	if transforms.is_empty():
+		return
+	var multimesh := MultiMesh.new()
+	multimesh.transform_format = MultiMesh.TRANSFORM_3D
+	multimesh.mesh = prop_mesh
+	multimesh.instance_count = transforms.size()
+	multimesh.visible_instance_count = transforms.size()
+	for index in range(transforms.size()):
+		multimesh.set_instance_transform(index, transforms[index])
+
+	var node := MultiMeshInstance3D.new()
+	node.multimesh = multimesh
+	node.material_override = materials[material_key]
+	node.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	add_child(node)
 
 
 func _setup_udp() -> void:
@@ -242,11 +315,16 @@ func _poll_network() -> void:
 
 
 func _apply_snapshot(snapshot: Dictionary) -> void:
+	var sequence := int(snapshot["sequence"])
 	packets_received += 1
-	snapshot_sequence = snapshot["sequence"]
-	udp.put_packet(GridwakeProtocol.encode_ack(snapshot_sequence))
+	snapshot_sequence = max(snapshot_sequence, sequence)
+	udp.put_packet(GridwakeProtocol.encode_ack(sequence))
+	_apply_snapshot_ops(sequence, snapshot["ops"])
 
-	for op in snapshot["ops"]:
+
+func _apply_snapshot_ops(sequence: int, ops: Array) -> void:
+	snapshot_sequence = max(snapshot_sequence, sequence)
+	for op in ops:
 		ops_received += 1
 		var entity := int(op["entity"])
 		if op["op"] == GridwakeProtocol.OP_DESPAWN_OR_EXIT:
@@ -265,15 +343,15 @@ func _apply_snapshot_fragment(fragment: Dictionary) -> void:
 	var fragment_index := int(fragment["fragment_index"])
 	var fragment_count := int(fragment["fragment_count"])
 	if fragment_count <= 1:
-		_apply_snapshot({
-			"sequence": sequence,
-			"baseline": fragment["baseline"],
-			"ops": fragment["ops"],
-		})
+		packets_received += 1
+		snapshot_sequence = max(snapshot_sequence, sequence)
+		udp.put_packet(GridwakeProtocol.encode_ack(sequence))
+		_apply_snapshot_ops(sequence, fragment["ops"])
 		return
 
 	var key := str(sequence)
 	if not snapshot_fragments.has(key):
+		_track_fragment_sequence(key)
 		snapshot_fragments[key] = {
 			"count": fragment_count,
 			"baseline": fragment["baseline"],
@@ -294,22 +372,32 @@ func _apply_snapshot_fragment(fragment: Dictionary) -> void:
 	if not parts.has(fragment_index):
 		parts[fragment_index] = fragment["ops"]
 		state["received"] = int(state["received"]) + 1
+		_apply_snapshot_ops(sequence, fragment["ops"])
+		snapshot_fragments[key] = state
 
 	if int(state["received"]) < fragment_count:
 		return
 
 	fragments_completed += 1
-	var ops: Array[Dictionary] = []
-	for index in range(fragment_count):
-		if not parts.has(index):
-			return
-		ops.append_array(parts[index])
 	snapshot_fragments.erase(key)
-	_apply_snapshot({
-		"sequence": sequence,
-		"baseline": state["baseline"],
-		"ops": ops,
-	})
+	_forget_fragment_sequence(key)
+	packets_received += 1
+	snapshot_sequence = max(snapshot_sequence, sequence)
+	udp.put_packet(GridwakeProtocol.encode_ack(sequence))
+
+
+func _track_fragment_sequence(key: String) -> void:
+	if fragment_sequence_order.has(key):
+		return
+	fragment_sequence_order.append(key)
+	var capacity: int = max(max_pending_fragment_sequences, 1)
+	while fragment_sequence_order.size() > capacity:
+		var old_key := String(fragment_sequence_order.pop_front())
+		snapshot_fragments.erase(old_key)
+
+
+func _forget_fragment_sequence(key: String) -> void:
+	fragment_sequence_order.erase(key)
 
 
 func _upsert_entity(entity: int, payload: Dictionary) -> void:
@@ -366,11 +454,15 @@ func _upsert_instanced_entity(entity: int, payload: Dictionary) -> void:
 
 	if int(payload["kind"]) == GridwakeProtocol.KIND_COVER:
 		_update_cover_counters(entity, payload)
+	elif int(payload["kind"]) == GridwakeProtocol.KIND_IMPACT:
+		impact_nodes[entity] = true
 
 
 func _transform_for_payload(payload: Dictionary) -> Transform3D:
 	if int(payload["kind"]) == GridwakeProtocol.KIND_COVER:
 		return _cover_transform_for_payload(payload)
+	if int(payload["kind"]) == GridwakeProtocol.KIND_IMPACT:
+		return _impact_transform_for_payload(payload)
 
 	var position: Vector3 = payload["position"]
 	var radius := float(payload["radius"])
@@ -388,6 +480,15 @@ func _cover_transform_for_payload(payload: Dictionary) -> Transform3D:
 	var position: Vector3 = payload["position"]
 	var basis := Basis.IDENTITY.scaled(Vector3(radius * 1.8, height, radius * 1.8))
 	return Transform3D(basis, Vector3(position.x, height * 0.5 - 0.06, position.z))
+
+
+func _impact_transform_for_payload(payload: Dictionary) -> Transform3D:
+	var position: Vector3 = payload["position"]
+	var radius := float(payload["radius"])
+	var phase := clampf(float(payload["phase"]), 0.0, 1.0)
+	var pulse := radius * (0.35 + phase * 1.35)
+	var basis := Basis.IDENTITY.scaled(Vector3.ONE * pulse)
+	return Transform3D(basis, Vector3(position.x, 0.25 + phase * 0.8, position.z))
 
 
 func _update_cover_counters(entity: int, payload: Dictionary) -> void:
@@ -414,6 +515,7 @@ func _remove_entity(entity: int) -> void:
 	cover_nodes.erase(entity)
 	damaged_cover_nodes.erase(entity)
 	ruined_cover_nodes.erase(entity)
+	impact_nodes.erase(entity)
 
 
 func _add_instanced_entity(entity: int, bucket_key: String, transform: Transform3D) -> void:
@@ -523,6 +625,8 @@ func _mesh_key_for_payload(payload: Dictionary) -> String:
 			return "effect"
 		GridwakeProtocol.KIND_COVER:
 			return "cover"
+		GridwakeProtocol.KIND_IMPACT:
+			return "impact"
 		_:
 			return "bot"
 
@@ -533,6 +637,8 @@ func _mesh_for_key(mesh_key: String) -> Mesh:
 			return effect_mesh
 		"cover":
 			return cover_mesh
+		"impact":
+			return impact_mesh
 		_:
 			return bot_mesh
 
@@ -550,6 +656,8 @@ func _apply_material(entity: int, node: MeshInstance3D, payload: Dictionary) -> 
 
 
 func _material_key_for_payload(payload: Dictionary) -> String:
+	if int(payload["kind"]) == GridwakeProtocol.KIND_IMPACT:
+		return "impact"
 	if int(payload["lod"]) == GridwakeProtocol.LOD_MINIMAL:
 		return "minimal"
 	match int(payload["kind"]):
@@ -662,7 +770,7 @@ func _update_camera() -> void:
 
 
 func _update_hud() -> void:
-	hud.text = "Gridwake Godot Demo\nserver %s:%d\nfps %.1f frame %.2fms proc %.2fms phys %.2fms\nvisible %d / cap %d instanced %d buckets %d nodes %d resources %d\nrender draw %d objects %d prim %d mem %.1fMB\ncover %d damaged %d ruined %d\nsnapshot %d udp %d last %d %.1f/s backlog %d fragments %d pending %d %.1f/s ops %d %.1f/s\n%s" % [
+	hud.text = "Gridwake Godot Demo\nserver %s:%d\nfps %.1f frame %.2fms proc %.2fms phys %.2fms\nvisible %d / cap %d instanced %d buckets %d nodes %d resources %d\nrender draw %d objects %d prim %d mem %.1fMB\ncover %d damaged %d ruined %d impacts %d\nsnapshot %d udp %d last %d %.1f/s backlog %d fragments %d pending %d %.1f/s ops %d %.1f/s\n%s" % [
 		server_host,
 		server_port,
 		perf_fps,
@@ -682,6 +790,7 @@ func _update_hud() -> void:
 		cover_nodes.size(),
 		damaged_cover_nodes.size(),
 		ruined_cover_nodes.size(),
+		impact_nodes.size(),
 		snapshot_sequence,
 		udp_packets_received,
 		udp_packets_last_frame,
