@@ -356,7 +356,13 @@ impl ReplicationGraph {
                 deferred_bytes = deferred_bytes.saturating_add(candidate.estimated_bytes);
                 continue;
             };
-            debug_assert!(budget.try_reserve(bytes));
+            let reserved = budget.try_reserve(bytes);
+            debug_assert!(reserved);
+            if !reserved {
+                deferred_updates += 1;
+                deferred_bytes = deferred_bytes.saturating_add(candidate.estimated_bytes);
+                continue;
+            }
 
             client_state
                 .priority_accumulator
