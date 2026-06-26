@@ -8,6 +8,7 @@ const TAG_CLIENT_ACK_SNAPSHOT := 0x01
 const TAG_CLIENT_INPUT := 0x02
 const TAG_SERVER_SNAPSHOT_DELTA := 0x81
 const TAG_SERVER_METRICS := 0x82
+const TAG_SERVER_SNAPSHOT_FRAGMENT := 0x83
 
 const OP_SPAWN_OR_ENTER := 0x01
 const OP_UPDATE := 0x02
@@ -66,6 +67,8 @@ static func decode_server_packet(packet: PackedByteArray) -> Dictionary:
 			return _decode_snapshot(stream)
 		TAG_SERVER_METRICS:
 			return _decode_metrics(stream)
+		TAG_SERVER_SNAPSHOT_FRAGMENT:
+			return _decode_snapshot_fragment(stream)
 		_:
 			return {"type": "invalid", "reason": "unknown tag", "tag": tag}
 
@@ -157,6 +160,47 @@ static func _decode_snapshot(stream: StreamPeerBuffer) -> Dictionary:
 		"type": "snapshot",
 		"sequence": sequence,
 		"baseline": baseline,
+		"ops": ops,
+	}
+
+
+static func _decode_snapshot_fragment(stream: StreamPeerBuffer) -> Dictionary:
+	var sequence := int(stream.get_u64())
+	var baseline := -1
+	var has_baseline := stream.get_u8()
+	if has_baseline == 1:
+		baseline = int(stream.get_u64())
+
+	var fragment_index := int(stream.get_u16())
+	var fragment_count := int(stream.get_u16())
+	var op_count := int(stream.get_u32())
+	var ops: Array[Dictionary] = []
+	for _index in op_count:
+		var op_tag := stream.get_u8()
+		var entity := int(stream.get_u64())
+		match op_tag:
+			OP_SPAWN_OR_ENTER, OP_UPDATE:
+				var payload_len := int(stream.get_u32())
+				var payload: PackedByteArray = stream.get_data(payload_len)[1]
+				ops.append({
+					"op": op_tag,
+					"entity": entity,
+					"payload": payload,
+				})
+			OP_DESPAWN_OR_EXIT:
+				ops.append({
+					"op": op_tag,
+					"entity": entity,
+				})
+			_:
+				return {"type": "invalid", "reason": "unknown op", "op": op_tag}
+
+	return {
+		"type": "snapshot_fragment",
+		"sequence": sequence,
+		"baseline": baseline,
+		"fragment_index": fragment_index,
+		"fragment_count": fragment_count,
 		"ops": ops,
 	}
 

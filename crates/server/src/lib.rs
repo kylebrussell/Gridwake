@@ -1100,6 +1100,12 @@ impl ServerRuntime {
             return false;
         };
         let payload = payload.into();
+        if entity.payload == payload
+            && entity.reduced_payload == payload
+            && entity.minimal_payload == payload
+        {
+            return true;
+        }
         entity.payload = payload.clone();
         entity.reduced_payload = payload.clone();
         entity.minimal_payload = payload;
@@ -1123,9 +1129,18 @@ impl ServerRuntime {
         let Some(entity) = self.entities.get_mut(&id) else {
             return false;
         };
-        entity.payload = full_payload.into();
-        entity.reduced_payload = reduced_payload.into();
-        entity.minimal_payload = minimal_payload.into();
+        let full_payload = full_payload.into();
+        let reduced_payload = reduced_payload.into();
+        let minimal_payload = minimal_payload.into();
+        if entity.payload == full_payload
+            && entity.reduced_payload == reduced_payload
+            && entity.minimal_payload == minimal_payload
+        {
+            return true;
+        }
+        entity.payload = full_payload;
+        entity.reduced_payload = reduced_payload;
+        entity.minimal_payload = minimal_payload;
         entity.estimated_bytes = entity.payload.len();
         self.replication.upsert_entity_with_lod_bytes(
             id,
@@ -1134,6 +1149,38 @@ impl ServerRuntime {
             entity.lod,
         );
         true
+    }
+
+    pub fn move_entity_with_lod_payloads(
+        &mut self,
+        id: EntityId,
+        position: Vec3,
+        payloads: NetworkLodPayloads,
+    ) -> bool {
+        let Some(entity) = self.entities.get_mut(&id) else {
+            return false;
+        };
+        entity.position = position;
+        self.aoi.update_entity(id, position);
+
+        let payloads_changed = entity.payload != payloads.full
+            || entity.reduced_payload != payloads.reduced
+            || entity.minimal_payload != payloads.minimal;
+        if payloads_changed {
+            entity.payload = payloads.full;
+            entity.reduced_payload = payloads.reduced;
+            entity.minimal_payload = payloads.minimal;
+            entity.estimated_bytes = entity.payload.len();
+            self.replication.upsert_entity_with_lod_bytes(
+                id,
+                entity.lod_bytes(),
+                entity.base_priority,
+                entity.lod,
+            );
+            true
+        } else {
+            self.replication.mark_dirty(id)
+        }
     }
 
     pub fn set_entity_lod(&mut self, id: EntityId, lod: NetworkLod) -> bool {
@@ -1916,6 +1963,83 @@ mod tests {
         assert_eq!(
             snapshot_payload_for(&transport, client, entity),
             b"reduced".to_vec()
+        );
+    }
+
+    #[test]
+    fn unchanged_lod_payloads_do_not_reselect_clean_entity() {
+        let mut runtime = ServerRuntime::new(ServerConfig {
+            default_interest_radius: 100.0,
+            per_client_byte_budget: 100,
+            ..ServerConfig::default()
+        });
+        let client = ClientId::new(1);
+        let entity = EntityId::new(1);
+        let mut transport = FakeTransport::default();
+
+        runtime.connect_client(client, Vec3::ZERO, None);
+        runtime.spawn_entity_with_lod_payloads(
+            entity,
+            Vec3::ZERO,
+            NetworkLodPayloads::new(b"full".to_vec(), b"reduced".to_vec(), b"min".to_vec()),
+            1.0,
+            NetworkLod::Full,
+        );
+        runtime.advance_tick(&mut transport);
+        transport.clear();
+
+        assert!(runtime.set_entity_lod_payloads(
+            entity,
+            b"full".to_vec(),
+            b"reduced".to_vec(),
+            b"min".to_vec()
+        ));
+        let metrics = runtime.advance_tick(&mut transport);
+
+        assert_eq!(metrics.selected_updates, 0);
+        assert!(transport.sent.is_empty());
+    }
+
+    #[test]
+    fn move_entity_with_lod_payloads_updates_position_and_payload_once() {
+        let mut runtime = ServerRuntime::new(ServerConfig {
+            default_interest_radius: 100.0,
+            per_client_byte_budget: 100,
+            ..ServerConfig::default()
+        });
+        let client = ClientId::new(1);
+        let entity = EntityId::new(1);
+        let mut transport = FakeTransport::default();
+
+        runtime.connect_client(client, Vec3::ZERO, None);
+        runtime.spawn_entity_with_lod_payloads(
+            entity,
+            Vec3::ZERO,
+            NetworkLodPayloads::new(b"full".to_vec(), b"reduced".to_vec(), b"min".to_vec()),
+            1.0,
+            NetworkLod::Full,
+        );
+        runtime.advance_tick(&mut transport);
+        transport.clear();
+
+        assert!(runtime.move_entity_with_lod_payloads(
+            entity,
+            Vec3::new(1.0, 0.0, 0.0),
+            NetworkLodPayloads::new(b"full-2".to_vec(), b"reduced-2".to_vec(), b"min-2".to_vec())
+        ));
+        let metrics = runtime.advance_tick(&mut transport);
+
+        assert_eq!(metrics.selected_updates, 1);
+        assert_eq!(
+            snapshot_payload_for(&transport, client, entity),
+            b"full-2".to_vec()
+        );
+        assert_eq!(
+            runtime
+                .latest_entity_position_sample(entity)
+                .unwrap()
+                .position,
+            Vec3::new(1.0, 0.0, 0.0)
         );
     }
 

@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use gridwake_core::{ClientId, EntityId, Vec3};
 use gridwake_protocol::{
-    decode_client_message, encode_server_message, ClientMessage, RoutedClientMessage, ServerMessage,
+    decode_client_message, encode_server_message, encoded_server_message_len, ClientMessage,
+    RoutedClientMessage, ServerMessage, SnapshotFragment,
 };
 use gridwake_server::{NetworkLod, NetworkLodPayloads, ServerConfig, ServerRuntime, Transport};
 use gridwake_snapshot::{DeltaOp, DeltaSnapshot};
@@ -37,6 +38,7 @@ const COVER_DAMAGE_INTERVAL_TICKS: u64 = 4;
 const PLAYER_BLAST_RADIUS: f32 = 15.0;
 const PLAYER_BLAST_DAMAGE: f32 = 42.0;
 const PLAYER_FIRE_COOLDOWN_TICKS: u64 = 8;
+const COVER_INDEX_CELL_SIZE: f32 = 16.0;
 
 #[derive(Clone, Debug)]
 struct Args {
@@ -50,6 +52,7 @@ struct Args {
     byte_budget: usize,
     max_datagram_bytes: usize,
     log_every_ticks: u64,
+    run_ticks: Option<u64>,
 }
 
 impl Default for Args {
@@ -65,6 +68,7 @@ impl Default for Args {
             byte_budget: 700,
             max_datagram_bytes: 1_200,
             log_every_ticks: 20,
+            run_ticks: None,
         }
     }
 }
@@ -105,6 +109,10 @@ impl DemoEntity {
 
     fn payloads_at(&self, seconds: f32) -> NetworkLodPayloads {
         let position = self.position_at(seconds);
+        self.payloads_at_position(seconds, position)
+    }
+
+    fn payloads_at_position(&self, seconds: f32, position: Vec3) -> NetworkLodPayloads {
         payloads_for_entity(
             self.kind,
             self.team,
@@ -115,6 +123,108 @@ impl DemoEntity {
             self.style,
         )
     }
+}
+
+#[derive(Debug)]
+struct CoverIndex {
+    cell_size: f32,
+    cells: HashMap<(i32, i32), Vec<usize>>,
+}
+
+impl CoverIndex {
+    fn new(covers: &[DemoCover], cell_size: f32) -> Self {
+        let mut cells: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+        for (index, cover) in covers.iter().enumerate() {
+            cells
+                .entry(Self::cell_for_position(cell_size, cover.position))
+                .or_default()
+                .push(index);
+        }
+        Self { cell_size, cells }
+    }
+
+    fn query_indices(&self, center: Vec3, radius: f32, out: &mut Vec<usize>) {
+        out.clear();
+        let min_x = self.cell_for_coord(center.x - radius);
+        let max_x = self.cell_for_coord(center.x + radius);
+        let min_z = self.cell_for_coord(center.z - radius);
+        let max_z = self.cell_for_coord(center.z + radius);
+        for x in min_x..=max_x {
+            for z in min_z..=max_z {
+                if let Some(indices) = self.cells.get(&(x, z)) {
+                    out.extend(indices.iter().copied());
+                }
+            }
+        }
+    }
+
+    fn cell_for_position(cell_size: f32, position: Vec3) -> (i32, i32) {
+        (
+            (position.x / cell_size).floor() as i32,
+            (position.z / cell_size).floor() as i32,
+        )
+    }
+
+    fn cell_for_coord(&self, value: f32) -> i32 {
+        (value / self.cell_size).floor() as i32
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PerfTotals {
+    ticks: u64,
+    update_micros: u128,
+    world_micros: u128,
+    runtime_micros: u128,
+    tick_micros: u128,
+    max_tick_micros: u128,
+}
+
+impl PerfTotals {
+    fn record(&mut self, sample: TickPerfSample) {
+        self.ticks = self.ticks.saturating_add(1);
+        self.update_micros = self.update_micros.saturating_add(sample.update_micros);
+        self.world_micros = self.world_micros.saturating_add(sample.world_micros);
+        self.runtime_micros = self.runtime_micros.saturating_add(sample.runtime_micros);
+        self.tick_micros = self.tick_micros.saturating_add(sample.tick_micros);
+        self.max_tick_micros = self.max_tick_micros.max(sample.tick_micros);
+    }
+
+    fn avg_ms(total_micros: u128, ticks: u64) -> f64 {
+        if ticks == 0 {
+            0.0
+        } else {
+            total_micros as f64 / ticks as f64 / 1_000.0
+        }
+    }
+
+    fn avg_update_ms(self) -> f64 {
+        Self::avg_ms(self.update_micros, self.ticks)
+    }
+
+    fn avg_world_ms(self) -> f64 {
+        Self::avg_ms(self.world_micros, self.ticks)
+    }
+
+    fn avg_runtime_ms(self) -> f64 {
+        Self::avg_ms(self.runtime_micros, self.ticks)
+    }
+
+    fn avg_tick_ms(self) -> f64 {
+        Self::avg_ms(self.tick_micros, self.ticks)
+    }
+
+    fn max_tick_ms(self) -> f64 {
+        self.max_tick_micros as f64 / 1_000.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TickPerfSample {
+    update_micros: u128,
+    world_micros: u128,
+    runtime_micros: u128,
+    tick_micros: u128,
 }
 
 #[derive(Clone, Debug)]
@@ -191,6 +301,9 @@ struct DemoUdpTransport {
     recv_buffer: Vec<u8>,
     max_datagram_bytes: usize,
     oversized_datagrams: u64,
+    datagrams_sent: u64,
+    bytes_sent: u64,
+    snapshot_fragments_sent: u64,
 }
 
 impl DemoUdpTransport {
@@ -205,6 +318,9 @@ impl DemoUdpTransport {
             recv_buffer: vec![0; RECV_BUFFER_BYTES],
             max_datagram_bytes,
             oversized_datagrams: 0,
+            datagrams_sent: 0,
+            bytes_sent: 0,
+            snapshot_fragments_sent: 0,
         })
     }
 
@@ -279,72 +395,93 @@ impl Transport for DemoUdpTransport {
 
 impl DemoUdpTransport {
     fn send_snapshot_delta(&mut self, client: ClientId, addr: SocketAddr, delta: DeltaSnapshot) {
-        match encode_server_message(&ServerMessage::SnapshotDelta(delta.clone())) {
-            Ok(bytes) if bytes.len() <= self.max_datagram_bytes => {
-                self.send_datagram(client, addr, bytes);
-                return;
-            }
-            Ok(_) => {}
-            Err(error) => {
-                eprintln!("encode error for client {}: {error}", client.raw());
-                return;
-            }
+        let message = ServerMessage::SnapshotDelta(delta);
+        let Ok(wire_len) = encoded_server_message_len(&message) else {
+            self.send_encoded_message(client, addr, &message);
+            return;
+        };
+        if wire_len <= self.max_datagram_bytes {
+            self.send_encoded_message(client, addr, &message);
+            return;
         }
 
-        let mut chunk = DeltaSnapshot::new(delta.sequence, delta.baseline, Vec::new());
-        for op in delta.ops {
-            chunk.ops.push(op);
-            match encode_server_message(&ServerMessage::SnapshotDelta(chunk.clone())) {
-                Ok(bytes) if bytes.len() <= self.max_datagram_bytes => continue,
-                Ok(_) => {
-                    let Some(oversized_op) = chunk.ops.pop() else {
-                        continue;
-                    };
-                    if !chunk.ops.is_empty() {
-                        let ops = std::mem::take(&mut chunk.ops);
-                        self.send_encoded_message(
-                            client,
-                            addr,
-                            &ServerMessage::SnapshotDelta(DeltaSnapshot::new(
-                                chunk.sequence,
-                                chunk.baseline,
-                                ops,
-                            )),
-                        );
-                    }
-                    self.queue_snapshot_op_or_drop(client, addr, &mut chunk, oversized_op);
-                }
-                Err(error) => {
-                    eprintln!("encode error for client {}: {error}", client.raw());
-                    chunk.ops.clear();
-                }
-            }
+        let ServerMessage::SnapshotDelta(delta) = message else {
+            unreachable!("snapshot delta message was just constructed");
+        };
+        let chunks = self.snapshot_chunks_for_datagram(client, addr, delta);
+        let fragment_count = chunks.len();
+        if fragment_count == 0 {
+            return;
+        }
+        if fragment_count > u16::MAX as usize {
+            eprintln!(
+                "drop snapshot for client {} at {addr}: fragments={} max={}",
+                client.raw(),
+                fragment_count,
+                u16::MAX
+            );
+            return;
         }
 
-        if !chunk.ops.is_empty() {
-            self.send_encoded_message(client, addr, &ServerMessage::SnapshotDelta(chunk));
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            let fragment = SnapshotFragment {
+                sequence: chunk.sequence,
+                baseline: chunk.baseline,
+                fragment_index: index as u16,
+                fragment_count: fragment_count as u16,
+                ops: chunk.ops,
+            };
+            self.snapshot_fragments_sent = self.snapshot_fragments_sent.saturating_add(1);
+            self.send_encoded_message(client, addr, &ServerMessage::SnapshotFragment(fragment));
         }
     }
 
-    fn queue_snapshot_op_or_drop(
+    fn snapshot_chunks_for_datagram(
         &mut self,
         client: ClientId,
         addr: SocketAddr,
-        chunk: &mut DeltaSnapshot,
-        op: DeltaOp,
-    ) {
-        chunk.ops.push(op);
-        match encode_server_message(&ServerMessage::SnapshotDelta(chunk.clone())) {
-            Ok(bytes) if bytes.len() <= self.max_datagram_bytes => {}
-            Ok(bytes) => {
-                chunk.ops.clear();
-                self.log_oversized_datagram(client, addr, bytes.len());
-            }
-            Err(error) => {
-                chunk.ops.clear();
-                eprintln!("encode error for client {}: {error}", client.raw());
-            }
+        delta: DeltaSnapshot,
+    ) -> Vec<DeltaSnapshot> {
+        let overhead = snapshot_fragment_overhead(delta.baseline);
+        if overhead >= self.max_datagram_bytes {
+            self.log_oversized_datagram(client, addr, overhead);
+            return Vec::new();
         }
+
+        let mut chunks = Vec::new();
+        let mut current_ops = Vec::new();
+        let mut current_len = overhead;
+        for op in delta.ops {
+            let op_len = delta_op_wire_len(&op);
+            if overhead.saturating_add(op_len) > self.max_datagram_bytes {
+                self.log_oversized_datagram(client, addr, overhead.saturating_add(op_len));
+                continue;
+            }
+
+            if current_len.saturating_add(op_len) > self.max_datagram_bytes
+                && !current_ops.is_empty()
+            {
+                chunks.push(DeltaSnapshot::new(
+                    delta.sequence,
+                    delta.baseline,
+                    std::mem::take(&mut current_ops),
+                ));
+                current_len = overhead;
+            }
+
+            current_len = current_len.saturating_add(op_len);
+            current_ops.push(op);
+        }
+
+        if !current_ops.is_empty() {
+            chunks.push(DeltaSnapshot::new(
+                delta.sequence,
+                delta.baseline,
+                current_ops,
+            ));
+        }
+
+        chunks
     }
 
     fn send_encoded_message(
@@ -366,6 +503,8 @@ impl DemoUdpTransport {
             self.log_oversized_datagram(client, addr, bytes.len());
             return;
         }
+        self.datagrams_sent = self.datagrams_sent.saturating_add(1);
+        self.bytes_sent = self.bytes_sent.saturating_add(bytes.len() as u64);
         if let Err(error) = self.socket.send_to(&bytes, addr) {
             eprintln!("send error to client {} at {addr}: {error}", client.raw());
         }
@@ -384,6 +523,32 @@ impl DemoUdpTransport {
     }
 }
 
+fn snapshot_fragment_overhead(baseline: Option<gridwake_core::SnapshotId>) -> usize {
+    let header = 4;
+    let sequence = 8;
+    let baseline_flag = 1;
+    let baseline_sequence = if baseline.is_some() { 8 } else { 0 };
+    let fragment_index = 2;
+    let fragment_count = 2;
+    let op_count = 4;
+    header
+        + sequence
+        + baseline_flag
+        + baseline_sequence
+        + fragment_index
+        + fragment_count
+        + op_count
+}
+
+fn delta_op_wire_len(op: &DeltaOp) -> usize {
+    match op {
+        DeltaOp::SpawnOrEnter { payload, .. } | DeltaOp::Update { payload, .. } => {
+            1 + 8 + 4 + payload.len()
+        }
+        DeltaOp::DespawnOrExit { .. } => 1 + 8,
+    }
+}
+
 fn main() -> io::Result<()> {
     let args = parse_args(env::args().skip(1))?;
     let mut runtime = ServerRuntime::new(ServerConfig {
@@ -396,10 +561,13 @@ fn main() -> io::Result<()> {
     let mut transport = DemoUdpTransport::bind(&args.bind, args.max_datagram_bytes)?;
     let mut demo_entities = seed_demo_entities(&mut runtime, &args);
     let mut covers = seed_demo_covers(&mut runtime, &args);
+    let cover_index = CoverIndex::new(&covers, COVER_INDEX_CELL_SIZE);
+    let mut cover_candidates = Vec::new();
     let mut clients = HashMap::new();
+    let mut perf_totals = PerfTotals::default();
 
     println!(
-        "gridwake Godot PSX demo server listening on {} bots={} effects={} cover={} tick_rate={} radius={} budget={} max_datagram={}",
+        "gridwake Godot PSX demo server listening on {} bots={} effects={} cover={} tick_rate={} radius={} budget={} max_datagram={} run_ticks={}",
         transport.local_addr()?,
         args.bots,
         args.effects,
@@ -407,7 +575,10 @@ fn main() -> io::Result<()> {
         args.tick_rate_hz,
         args.interest_radius,
         args.byte_budget,
-        args.max_datagram_bytes
+        args.max_datagram_bytes,
+        args.run_ticks
+            .map(|ticks| ticks.to_string())
+            .unwrap_or_else(|| "infinite".to_owned())
     );
 
     let tick_interval = Duration::from_secs_f64(1.0 / f64::from(args.tick_rate_hz));
@@ -421,26 +592,44 @@ fn main() -> io::Result<()> {
             &mut transport,
             &mut clients,
             &mut covers,
+            &cover_index,
+            &mut cover_candidates,
             tick_count,
         );
 
         let now = Instant::now();
         if now >= next_tick {
+            let tick_started = Instant::now();
             tick_count = tick_count.saturating_add(1);
             let seconds = started.elapsed().as_secs_f32();
+            let update_started = Instant::now();
             update_demo_entities(&mut runtime, &mut demo_entities, seconds);
+            let update_micros = update_started.elapsed().as_micros();
+            let world_started = Instant::now();
             let world_events = update_destructible_world(
                 &mut runtime,
                 &demo_entities,
                 &mut covers,
+                &cover_index,
+                &mut cover_candidates,
                 seconds,
                 tick_count,
             );
+            let world_micros = world_started.elapsed().as_micros();
+            let runtime_started = Instant::now();
             let metrics = runtime.advance_tick(&mut transport);
+            let runtime_micros = runtime_started.elapsed().as_micros();
+            let sample = TickPerfSample {
+                update_micros,
+                world_micros,
+                runtime_micros,
+                tick_micros: tick_started.elapsed().as_micros(),
+            };
+            perf_totals.record(sample);
 
             if metrics.tick.raw() % args.log_every_ticks == 0 {
                 println!(
-                    "tick={} clients={} entities={} aoi={} selected={} lod={}/{}/{} deferred={} bytes={} messages={} cover_hits={} cover_destroyed={}",
+                    "tick={} clients={} entities={} aoi={} selected={} lod={}/{}/{} deferred={} bytes={} messages={} cover_hits={} cover_destroyed={} ms={:.3}/{:.3}/{:.3}/{:.3} datagrams={} net_bytes={} fragments={}",
                     metrics.tick.raw(),
                     metrics.clients,
                     metrics.entities,
@@ -453,8 +642,35 @@ fn main() -> io::Result<()> {
                     metrics.bytes_scheduled,
                     metrics.messages_sent,
                     world_events.cover_hits,
-                    world_events.cover_destroyed
+                    world_events.cover_destroyed,
+                    sample.tick_micros as f64 / 1_000.0,
+                    sample.update_micros as f64 / 1_000.0,
+                    sample.world_micros as f64 / 1_000.0,
+                    sample.runtime_micros as f64 / 1_000.0,
+                    transport.datagrams_sent,
+                    transport.bytes_sent,
+                    transport.snapshot_fragments_sent
                 );
+            }
+
+            if args
+                .run_ticks
+                .is_some_and(|run_ticks| tick_count >= run_ticks)
+            {
+                println!(
+                    "summary ticks={} avg_tick_ms={:.3} max_tick_ms={:.3} avg_update_ms={:.3} avg_world_ms={:.3} avg_runtime_ms={:.3} datagrams={} net_bytes={} fragments={} oversized={}",
+                    perf_totals.ticks,
+                    perf_totals.avg_tick_ms(),
+                    perf_totals.max_tick_ms(),
+                    perf_totals.avg_update_ms(),
+                    perf_totals.avg_world_ms(),
+                    perf_totals.avg_runtime_ms(),
+                    transport.datagrams_sent,
+                    transport.bytes_sent,
+                    transport.snapshot_fragments_sent,
+                    transport.oversized_datagrams
+                );
+                return Ok(());
             }
 
             next_tick += tick_interval;
@@ -478,6 +694,8 @@ fn handle_inbound(
     transport: &mut DemoUdpTransport,
     clients: &mut HashMap<ClientId, ClientState>,
     covers: &mut [DemoCover],
+    cover_index: &CoverIndex,
+    cover_candidates: &mut Vec<usize>,
     tick: u64,
 ) {
     for inbound in transport.drain_client_messages() {
@@ -512,6 +730,8 @@ fn handle_inbound(
                             damage_covers(
                                 runtime,
                                 covers,
+                                cover_index,
+                                cover_candidates,
                                 blast,
                                 PLAYER_BLAST_RADIUS,
                                 PLAYER_BLAST_DAMAGE,
@@ -638,14 +858,8 @@ fn seed_demo_covers(runtime: &mut ServerRuntime, args: &Args) -> Vec<DemoCover> 
 fn update_demo_entities(runtime: &mut ServerRuntime, entities: &mut [DemoEntity], seconds: f32) {
     for entity in entities {
         let position = entity.position_at(seconds);
-        runtime.move_entity(entity.entity, position);
-        let payloads = entity.payloads_at(seconds);
-        runtime.set_entity_lod_payloads(
-            entity.entity,
-            payloads.full,
-            payloads.reduced,
-            payloads.minimal,
-        );
+        let payloads = entity.payloads_at_position(seconds, position);
+        runtime.move_entity_with_lod_payloads(entity.entity, position, payloads);
     }
 }
 
@@ -653,6 +867,8 @@ fn update_destructible_world(
     runtime: &mut ServerRuntime,
     emitters: &[DemoEntity],
     covers: &mut [DemoCover],
+    cover_index: &CoverIndex,
+    cover_candidates: &mut Vec<usize>,
     seconds: f32,
     tick: u64,
 ) -> WorldEventStats {
@@ -674,6 +890,8 @@ fn update_destructible_world(
         stats += damage_covers(
             runtime,
             covers,
+            cover_index,
+            cover_candidates,
             blast,
             COVER_DAMAGE_RADIUS,
             COVER_DAMAGE_PER_HIT,
@@ -693,13 +911,19 @@ impl std::ops::AddAssign for WorldEventStats {
 fn damage_covers(
     runtime: &mut ServerRuntime,
     covers: &mut [DemoCover],
+    cover_index: &CoverIndex,
+    cover_candidates: &mut Vec<usize>,
     center: Vec3,
     radius: f32,
     damage_amount: f32,
 ) -> WorldEventStats {
     let mut stats = WorldEventStats::default();
     let radius_squared = radius * radius;
-    for cover in covers.iter_mut() {
+    cover_index.query_indices(center, radius, cover_candidates);
+    for &cover_slot in cover_candidates.iter() {
+        let Some(cover) = covers.get_mut(cover_slot) else {
+            continue;
+        };
         if cover.is_destroyed() {
             continue;
         }
@@ -899,6 +1123,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> io::Result<Args> {
             "--budget" => parsed.byte_budget = parse_positive(&arg, &value)?,
             "--max-datagram" => parsed.max_datagram_bytes = parse_positive(&arg, &value)?,
             "--log-every" => parsed.log_every_ticks = parse_positive(&arg, &value)?,
+            "--run-ticks" => parsed.run_ticks = Some(parse_positive(&arg, &value)?),
             _ => return Err(invalid_input(format!("unknown argument {arg}"))),
         }
     }
@@ -907,7 +1132,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> io::Result<Args> {
 
 fn print_usage() {
     eprintln!(
-        "usage: cargo run -p gridwake-server --example godot_psx_demo_server -- [--bind 127.0.0.1:3456] [--bots N] [--effects N] [--cover N] [--tick-rate HZ] [--world-size N] [--radius N] [--budget BYTES] [--max-datagram BYTES] [--log-every TICKS]"
+        "usage: cargo run -p gridwake-server --example godot_psx_demo_server -- [--bind 127.0.0.1:3456] [--bots N] [--effects N] [--cover N] [--tick-rate HZ] [--world-size N] [--radius N] [--budget BYTES] [--max-datagram BYTES] [--log-every TICKS] [--run-ticks TICKS]"
     );
 }
 

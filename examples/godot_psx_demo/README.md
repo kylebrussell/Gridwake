@@ -13,8 +13,8 @@ cargo run -p gridwake-server --example godot_psx_demo_server -- --bots 2000 --ef
 Open `examples/godot_psx_demo/project.godot` in Godot 4.7 and run the project.
 
 The server defaults to a conservative `--budget 700` and `--max-datagram 1200`.
-The demo transport splits oversized snapshot deltas into multiple UDP datagrams,
-which keeps initial joins and heavy destructive updates inside the datagram cap.
+The demo transport splits oversized snapshot deltas into fragment datagrams, and
+the Godot client only acks a snapshot after all fragments have been reassembled.
 
 Keyboard controls:
 
@@ -30,4 +30,10 @@ cargo run -p gridwake-server --example godot_psx_demo_server -- --bots 200 --eff
 godot --path examples/godot_psx_demo
 ```
 
-The HUD shows visible entity count, snapshot sequence, packet count, and decoded op count. The server logs AOI candidates, selected updates, LOD mix, deferred updates, bytes, and message counts.
+For a repeatable server-side benchmark:
+
+```sh
+cargo run --release -p gridwake-server --example godot_psx_demo_server -- --bots 2000 --effects 350 --cover 900 --budget 1400 --max-datagram 4096 --run-ticks 200
+```
+
+The HUD shows visible entity count, snapshot sequence, packet backlog, pending fragments, and decoded op count. The server logs AOI candidates, selected updates, LOD mix, deferred updates, bytes, message counts, timing buckets, datagrams, bytes sent, and fragments sent.

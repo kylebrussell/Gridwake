@@ -8,16 +8,20 @@ const GridwakeProtocol := preload("res://scripts/gridwake_protocol.gd")
 @export var move_speed := 28.0
 @export var turn_speed := 2.4
 @export var max_visual_entities := 6000
+@export var max_packets_per_frame := 32
 
 var udp := PacketPeerUDP.new()
 var entity_nodes: Dictionary = {}
+var entity_material_keys: Dictionary = {}
 var player_position := Vector3(0.0, 0.5, 18.0)
 var player_yaw := 0.0
 var input_accumulator := 0.0
 var snapshot_sequence := -1
 var packets_received := 0
+var packets_backlogged := 0
 var ops_received := 0
 var last_server_error := ""
+var snapshot_fragments: Dictionary = {}
 
 var bot_mesh: BoxMesh
 var player_mesh: BoxMesh
@@ -186,15 +190,20 @@ func _update_player(delta: float) -> void:
 
 
 func _poll_network() -> void:
-	while udp.get_available_packet_count() > 0:
+	var packets_processed := 0
+	while udp.get_available_packet_count() > 0 and packets_processed < max_packets_per_frame:
+		packets_processed += 1
 		var decoded := GridwakeProtocol.decode_server_packet(udp.get_packet())
 		match decoded.get("type", ""):
 			"snapshot":
 				_apply_snapshot(decoded)
+			"snapshot_fragment":
+				_apply_snapshot_fragment(decoded)
 			"metrics":
 				pass
 			"invalid":
 				last_server_error = decoded.get("reason", "invalid packet")
+	packets_backlogged = udp.get_available_packet_count()
 
 
 func _apply_snapshot(snapshot: Dictionary) -> void:
@@ -213,6 +222,57 @@ func _apply_snapshot(snapshot: Dictionary) -> void:
 		if payload.is_empty():
 			continue
 		_upsert_entity(entity, payload)
+
+
+func _apply_snapshot_fragment(fragment: Dictionary) -> void:
+	var sequence := int(fragment["sequence"])
+	var fragment_index := int(fragment["fragment_index"])
+	var fragment_count := int(fragment["fragment_count"])
+	if fragment_count <= 1:
+		_apply_snapshot({
+			"sequence": sequence,
+			"baseline": fragment["baseline"],
+			"ops": fragment["ops"],
+		})
+		return
+
+	var key := str(sequence)
+	if not snapshot_fragments.has(key):
+		snapshot_fragments[key] = {
+			"count": fragment_count,
+			"baseline": fragment["baseline"],
+			"parts": {},
+			"received": 0,
+		}
+	var state: Dictionary = snapshot_fragments[key]
+	if int(state["count"]) != fragment_count:
+		state = {
+			"count": fragment_count,
+			"baseline": fragment["baseline"],
+			"parts": {},
+			"received": 0,
+		}
+		snapshot_fragments[key] = state
+
+	var parts: Dictionary = state["parts"]
+	if not parts.has(fragment_index):
+		parts[fragment_index] = fragment["ops"]
+		state["received"] = int(state["received"]) + 1
+
+	if int(state["received"]) < fragment_count:
+		return
+
+	var ops: Array[Dictionary] = []
+	for index in range(fragment_count):
+		if not parts.has(index):
+			return
+		ops.append_array(parts[index])
+	snapshot_fragments.erase(key)
+	_apply_snapshot({
+		"sequence": sequence,
+		"baseline": state["baseline"],
+		"ops": ops,
+	})
 
 
 func _upsert_entity(entity: int, payload: Dictionary) -> void:
@@ -235,7 +295,7 @@ func _upsert_entity(entity: int, payload: Dictionary) -> void:
 	var radius := float(payload["radius"])
 	var lod := int(payload["lod"])
 	node.scale = Vector3.ONE * (radius * _lod_scale(lod))
-	node.material_override = _material_for_payload(payload)
+	_apply_material(entity, node, payload)
 
 
 func _create_entity_node(payload: Dictionary) -> MeshInstance3D:
@@ -260,7 +320,7 @@ func _update_cover_node(entity: int, node: MeshInstance3D, payload: Dictionary) 
 	node.position = Vector3(position.x, height * 0.5 - 0.06, position.z)
 	node.rotation.y = 0.0
 	node.scale = Vector3(radius * 1.8, height, radius * 1.8)
-	node.material_override = _material_for_payload(payload)
+	_apply_material(entity, node, payload)
 	cover_nodes[entity] = true
 	if health < 0.7:
 		damaged_cover_nodes[entity] = true
@@ -277,29 +337,38 @@ func _remove_entity(entity: int) -> void:
 		return
 	var node: Node = entity_nodes[entity]
 	entity_nodes.erase(entity)
+	entity_material_keys.erase(entity)
 	cover_nodes.erase(entity)
 	damaged_cover_nodes.erase(entity)
 	ruined_cover_nodes.erase(entity)
 	node.queue_free()
 
 
-func _material_for_payload(payload: Dictionary) -> StandardMaterial3D:
+func _apply_material(entity: int, node: MeshInstance3D, payload: Dictionary) -> void:
+	var material_key := _material_key_for_payload(payload)
+	if entity_material_keys.get(entity, "") == material_key:
+		return
+	entity_material_keys[entity] = material_key
+	node.material_override = materials[material_key]
+
+
+func _material_key_for_payload(payload: Dictionary) -> String:
 	if int(payload["lod"]) == GridwakeProtocol.LOD_MINIMAL:
-		return materials["minimal"]
+		return "minimal"
 	match int(payload["kind"]):
 		GridwakeProtocol.KIND_PLAYER:
-			return materials["player"]
+			return "player"
 		GridwakeProtocol.KIND_EFFECT:
-			return materials["effect"]
+			return "effect"
 		GridwakeProtocol.KIND_COVER:
 			var health := _cover_health(payload)
 			if health <= 0.05:
-				return materials["cover_ruined"]
+				return "cover_ruined"
 			if health < 0.7:
-				return materials["cover_damaged"]
-			return materials["cover_%d" % int(payload["team"] % 4)]
+				return "cover_damaged"
+			return "cover_%d" % int(payload["team"] % 4)
 		_:
-			return materials["bot_%d" % int(payload["team"] % 3)]
+			return "bot_%d" % int(payload["team"] % 3)
 
 
 func _lod_scale(lod: int) -> float:
@@ -331,7 +400,7 @@ func _update_camera() -> void:
 
 
 func _update_hud() -> void:
-	hud.text = "Gridwake Godot Demo\nserver %s:%d\nvisible %d / cap %d\ncover %d damaged %d ruined %d\nsnapshot %d packets %d ops %d\n%s" % [
+	hud.text = "Gridwake Godot Demo\nserver %s:%d\nvisible %d / cap %d\ncover %d damaged %d ruined %d\nsnapshot %d packets %d backlog %d fragments %d ops %d\n%s" % [
 		server_host,
 		server_port,
 		entity_nodes.size(),
@@ -341,6 +410,8 @@ func _update_hud() -> void:
 		ruined_cover_nodes.size(),
 		snapshot_sequence,
 		packets_received,
+		packets_backlogged,
+		snapshot_fragments.size(),
 		ops_received,
 		last_server_error,
 	]
