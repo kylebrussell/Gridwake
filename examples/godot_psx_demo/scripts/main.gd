@@ -1,6 +1,8 @@
 extends Node3D
 
 const GridwakeProtocol := preload("res://scripts/gridwake_protocol.gd")
+const LOCAL_FIRE_COOLDOWN_MSEC := 380
+const SHOT_FLASH_SECONDS := 0.12
 
 @export var server_host := "127.0.0.1"
 @export var server_port := 3456
@@ -30,6 +32,8 @@ var player_yaw := 0.0
 var camera_initialized := false
 var camera_look_position := Vector3.ZERO
 var input_accumulator := 0.0
+var next_local_fire_msec := 0
+var shot_flash_seconds := 0.0
 var snapshot_sequence := -1
 var packets_received := 0
 var packets_backlogged := 0
@@ -73,6 +77,9 @@ var materials: Dictionary = {}
 var camera: Camera3D
 var hud: Label
 var crosshair_root: Control
+var crosshair_marks: Array = []
+var shot_beam: MeshInstance3D
+var shot_beam_mesh: BoxMesh
 var cover_nodes: Dictionary = {}
 var damaged_cover_nodes: Dictionary = {}
 var ruined_cover_nodes: Dictionary = {}
@@ -105,6 +112,8 @@ func _exit_tree() -> void:
 func _input(event: InputEvent) -> void:
 	if event is InputEventMouseButton and event.pressed:
 		Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
+		if event.button_index == MOUSE_BUTTON_LEFT:
+			_try_trigger_shot_feedback()
 	if event is InputEventMouseMotion and Input.get_mouse_mode() == Input.MOUSE_MODE_CAPTURED and local_player_health > 0.0:
 		player_yaw -= event.relative.x * mouse_sensitivity
 	if event is InputEventKey and event.pressed and event.keycode == KEY_ESCAPE:
@@ -112,10 +121,13 @@ func _input(event: InputEvent) -> void:
 			Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
 		else:
 			Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
+	elif event is InputEventKey and event.pressed and event.keycode == KEY_SPACE:
+		_try_trigger_shot_feedback()
 
 
 func _process(delta: float) -> void:
 	_update_camera(delta)
+	_update_shot_feedback(delta)
 	_update_hud()
 
 
@@ -173,6 +185,7 @@ func _setup_world() -> void:
 	_create_materials()
 	_create_floor()
 	_create_arena_props()
+	_create_shot_feedback()
 
 	var canvas := CanvasLayer.new()
 	hud = Label.new()
@@ -193,11 +206,17 @@ func _create_crosshair(canvas: CanvasLayer) -> void:
 	canvas.add_child(crosshair_root)
 
 	var color := Color(0.78, 0.95, 1.0, 0.78)
-	crosshair_root.add_child(_crosshair_rect(Vector2(-1.0, -1.0), Vector2(2.0, 2.0), color))
-	crosshair_root.add_child(_crosshair_rect(Vector2(-1.0, -14.0), Vector2(2.0, 8.0), color))
-	crosshair_root.add_child(_crosshair_rect(Vector2(-1.0, 6.0), Vector2(2.0, 8.0), color))
-	crosshair_root.add_child(_crosshair_rect(Vector2(-14.0, -1.0), Vector2(8.0, 2.0), color))
-	crosshair_root.add_child(_crosshair_rect(Vector2(6.0, -1.0), Vector2(8.0, 2.0), color))
+	_add_crosshair_rect(Vector2(-1.0, -1.0), Vector2(2.0, 2.0), color)
+	_add_crosshair_rect(Vector2(-1.0, -14.0), Vector2(2.0, 8.0), color)
+	_add_crosshair_rect(Vector2(-1.0, 6.0), Vector2(2.0, 8.0), color)
+	_add_crosshair_rect(Vector2(-14.0, -1.0), Vector2(8.0, 2.0), color)
+	_add_crosshair_rect(Vector2(6.0, -1.0), Vector2(8.0, 2.0), color)
+
+
+func _add_crosshair_rect(offset: Vector2, size: Vector2, color: Color) -> void:
+	var rect := _crosshair_rect(offset, size, color)
+	crosshair_marks.append(rect)
+	crosshair_root.add_child(rect)
 
 
 func _crosshair_rect(offset: Vector2, size: Vector2, color: Color) -> ColorRect:
@@ -213,6 +232,18 @@ func _crosshair_rect(offset: Vector2, size: Vector2, color: Color) -> ColorRect:
 	rect.offset_bottom = offset.y + size.y
 	rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	return rect
+
+
+func _create_shot_feedback() -> void:
+	shot_beam_mesh = BoxMesh.new()
+	shot_beam_mesh.size = Vector3(0.18, 0.18, 36.0)
+
+	shot_beam = MeshInstance3D.new()
+	shot_beam.mesh = shot_beam_mesh
+	shot_beam.material_override = _material(Color(0.74, 0.96, 1.0))
+	shot_beam.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	shot_beam.visible = false
+	add_child(shot_beam)
 
 
 func _create_materials() -> void:
@@ -354,7 +385,7 @@ func _update_player(delta: float) -> void:
 	player_yaw += turn * turn_speed * delta
 
 	var forward := Vector3(sin(player_yaw), 0.0, cos(player_yaw))
-	var right := Vector3(forward.z, 0.0, -forward.x)
+	var right := Vector3(-forward.z, 0.0, forward.x)
 	var movement := Vector3.ZERO
 	if Input.is_key_pressed(KEY_UP) or Input.is_key_pressed(KEY_W):
 		movement += forward
@@ -840,11 +871,50 @@ func _combat_health(payload: Dictionary) -> float:
 
 
 func _send_input() -> void:
-	udp.put_packet(GridwakeProtocol.encode_input(player_position, player_yaw, _fire_pressed()))
+	var fire := _fire_pressed()
+	if fire:
+		_try_trigger_shot_feedback()
+	udp.put_packet(GridwakeProtocol.encode_input(player_position, player_yaw, fire))
 
 
 func _fire_pressed() -> bool:
 	return Input.is_key_pressed(KEY_SPACE) or Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)
+
+
+func _try_trigger_shot_feedback() -> void:
+	if local_player_health <= 0.0:
+		return
+	var now_msec := Time.get_ticks_msec()
+	if now_msec < next_local_fire_msec:
+		return
+	next_local_fire_msec = now_msec + LOCAL_FIRE_COOLDOWN_MSEC
+	shot_flash_seconds = SHOT_FLASH_SECONDS
+	_position_shot_beam(1.0)
+
+
+func _update_shot_feedback(delta: float) -> void:
+	if shot_flash_seconds > 0.0:
+		shot_flash_seconds = maxf(shot_flash_seconds - delta, 0.0)
+	var pulse := shot_flash_seconds / SHOT_FLASH_SECONDS
+	if shot_beam != null:
+		shot_beam.visible = pulse > 0.0
+		if pulse > 0.0:
+			_position_shot_beam(pulse)
+	var color := Color(0.78, 0.95, 1.0, 0.78)
+	if pulse > 0.0:
+		color = Color(1.0, 0.98, 0.72, 1.0)
+	for mark in crosshair_marks:
+		mark.color = color
+
+
+func _position_shot_beam(pulse: float) -> void:
+	if shot_beam == null:
+		return
+	var forward := Vector3(sin(player_yaw), 0.0, cos(player_yaw))
+	shot_beam.position = player_position + Vector3(0.0, 1.05, 0.0) + forward * 24.0
+	shot_beam.rotation = Vector3(0.0, player_yaw, 0.0)
+	var thickness := 1.0 + pulse * 1.8
+	shot_beam.scale = Vector3(thickness, thickness, 1.0)
 
 
 func _update_perf(delta: float) -> void:
