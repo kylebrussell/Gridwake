@@ -7,6 +7,7 @@ const GridwakeProtocol := preload("res://scripts/gridwake_protocol.gd")
 @export var input_send_hz := 30.0
 @export var move_speed := 28.0
 @export var turn_speed := 2.4
+@export var server_position_snap_distance := 28.0
 @export var max_visual_entities := 6000
 @export var max_packets_per_frame := 32
 @export var max_pending_fragment_sequences := 8
@@ -72,6 +73,8 @@ var score_nodes: Dictionary = {}
 var local_player_entity := -1
 var local_player_team := -1
 var local_player_health := 1.0
+var has_local_server_position := false
+var local_server_position := Vector3.ZERO
 var red_score := 0
 var blue_score := 0
 
@@ -166,7 +169,7 @@ func _create_materials() -> void:
 	materials["player_down"] = _material(Color(0.16, 0.16, 0.18))
 	materials["effect_red"] = _material(Color(1.0, 0.35, 0.42))
 	materials["effect_blue"] = _material(Color(0.30, 0.62, 1.0))
-	materials["impact"] = _material(Color(1.0, 0.74, 0.30))
+	materials["impact"] = _material(Color(0.82, 0.36, 0.20))
 	materials["score_red"] = _material(Color(1.0, 0.10, 0.08))
 	materials["score_blue"] = _material(Color(0.10, 0.42, 1.0))
 	materials["minimal"] = _material(Color(0.52, 0.57, 0.66))
@@ -438,21 +441,37 @@ func _upsert_player_node(entity: int, payload: Dictionary) -> void:
 	else:
 		return
 
-	node.position = payload["position"]
-	node.rotation.y = payload["yaw"]
+	var server_position: Vector3 = payload["position"]
+	var server_yaw := float(payload["yaw"])
 	var radius := float(payload["radius"])
 	var lod := int(payload["lod"])
 	var health := _combat_health(payload)
+	if local_player_entity == -1:
+		local_player_entity = entity
+	var is_local := local_player_entity == entity
+	if is_local:
+		_sync_local_player_from_server(server_position, int(payload["team"]), health)
+		node.position = player_position
+		node.rotation.y = player_yaw if health > 0.0 else server_yaw
+	else:
+		node.position = server_position
+		node.rotation.y = server_yaw
 	var height_scale: float = 0.35 if health <= 0.0 else 1.0
 	node.scale = Vector3(radius * _lod_scale(lod), radius * _lod_scale(lod) * height_scale, radius * _lod_scale(lod))
 	_apply_material(entity, node, payload)
 
-	if local_player_entity == -1:
-		local_player_entity = entity
-	if local_player_entity == entity:
-		player_position = payload["position"]
-		local_player_team = int(payload["team"])
-		local_player_health = health
+
+func _sync_local_player_from_server(server_position: Vector3, team: int, health: float) -> void:
+	var was_waiting_for_server := not has_local_server_position
+	var was_dead := local_player_health <= 0.0
+	var just_respawned := was_dead and health > 0.0
+	var drift := player_position.distance_to(server_position)
+	local_server_position = server_position
+	has_local_server_position = true
+	local_player_team = team
+	if was_waiting_for_server or health <= 0.0 or just_respawned or drift > server_position_snap_distance:
+		player_position = server_position
+	local_player_health = health
 
 
 func _upsert_instanced_entity(entity: int, payload: Dictionary) -> void:
@@ -517,9 +536,10 @@ func _impact_transform_for_payload(payload: Dictionary) -> Transform3D:
 	var position: Vector3 = payload["position"]
 	var radius := float(payload["radius"])
 	var phase := clampf(float(payload["phase"]), 0.0, 1.0)
-	var pulse := radius * (0.35 + phase * 1.35)
-	var basis := Basis.IDENTITY.scaled(Vector3.ONE * pulse)
-	return Transform3D(basis, Vector3(position.x, 0.25 + phase * 0.8, position.z))
+	var horizontal_pulse := clampf(radius * (0.08 + phase * 0.16), 0.28, 2.6)
+	var vertical_pulse := clampf(radius * (0.035 + phase * 0.055), 0.14, 0.75)
+	var basis := Basis.IDENTITY.scaled(Vector3(horizontal_pulse, vertical_pulse, horizontal_pulse))
+	return Transform3D(basis, Vector3(position.x, 0.12 + vertical_pulse * 0.5, position.z))
 
 
 func _scoreboard_transform_for_payload(payload: Dictionary) -> Transform3D:
@@ -536,9 +556,6 @@ func _update_match_state(entity: int, payload: Dictionary) -> void:
 		var packed_scores := int(payload["style"])
 		red_score = packed_scores & 0x0fff
 		blue_score = (packed_scores >> 12) & 0x0fff
-	if local_player_entity == entity and kind == GridwakeProtocol.KIND_PLAYER:
-		local_player_team = int(payload["team"])
-		local_player_health = _combat_health(payload)
 
 
 func _update_cover_counters(entity: int, payload: Dictionary) -> void:
